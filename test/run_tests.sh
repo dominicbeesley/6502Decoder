@@ -10,8 +10,8 @@ MAXDIFFSIZE=500000000
 common_options="--phi2="
 
 machine_names=(
-    master
     beeb
+    master
     elk
     beebr65c02
 )
@@ -39,12 +39,12 @@ extended_data_names=(
 declare -A data_options
 
 data_options[reset]="-h -s"
-data_options[dormann_d6502]="--quiet --emulate"
-data_options[dormann_d65c00]="--quiet --emulate"
-data_options[dormann_d65c01]="--quiet --emulate"
-data_options[dormann_d65c10]="--quiet --emulate"
-data_options[dormann_d65c11]="--quiet --emulate"
-data_options[clark_bcd_full]="--quiet --emulate"
+data_options[dormann_d6502]="--quiet"
+data_options[dormann_d65c00]="--quiet"
+data_options[dormann_d65c01]="--quiet"
+data_options[dormann_d65c10]="--quiet"
+data_options[dormann_d65c11]="--quiet"
+data_options[clark_bcd_full]="--quiet"
 
 test_names=(
     sync
@@ -115,6 +115,12 @@ else
     echo "Running basic tests:"
 fi
 
+if [[ `uname` = Darwin ]]; then
+  STATARGS=-f%z
+else
+  STATARGS=-c%s
+fi
+
 for data in "${data_names[@]}"
 do
     for machine in "${machine_names[@]}"
@@ -142,7 +148,7 @@ do
                 fi
                 fail_count=`grep fail ${log} | wc -l`
                 md5=`md5sum ${log} | cut -c1-8`
-                size=$(stat -c%s "${log}")
+                size=$(stat ${STATARGS} "${log}")
                 echo "  Trace MD5: ${md5}; Prediction fail count: ${fail_count}"
                 # Log some context around each failure (limit to 100 failures)
                 # Compare md5 of results with ref, rather than using diff, as diff can blow up

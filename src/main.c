@@ -3,13 +3,12 @@
 #include <inttypes.h>
 #include <argp.h>
 #include <string.h>
+#include <math.h>
 
+#include "defs.h"
 #include "em_6502.h"
+#include "em_65816.h"
 #include "profiler.h"
-
-// Sync-less decoder queue depth (samples)
-// (min of 3 needed to reliably detect interrupts)
-#define DEPTH 3
 
 int sample_count = 0;
 
@@ -19,19 +18,32 @@ uint8_t buffer8[BUFSIZE];
 
 uint16_t buffer[BUFSIZE];
 
-// Whether to emulate each decoded instruction, to track additional state (registers and flags)
-int do_emulate = 0;
-
-#define MACHINE_DEFAULT 0
-#define MACHINE_MASTER  1
-#define MACHINE_ELK  2
-
 const char *machine_names[] = {
    "default",
    "master",
    "elk",
    0
 };
+
+// escaping is to avoid unwanted trigraphs
+const char default_fwa[] = "\?\?-\?\?:\?\?\?\?\?\?\?\?:\?\?:\?\? = \?\?\?\?\?\?\?\?\?\?\?\?\?\?\?";
+
+#define OFFSET_SIGN      0
+#define OFFSET_EXP       3
+#define OFFSET_MANTISSA  6
+#define OFFSET_ROUND    15
+#define OFFSET_OVERFLOW 18
+#define OFFSET_VALUE    23
+
+static char fwabuf[80];
+static char disbuf[256];
+
+static cpu_emulator_t *em;
+
+static int c816;
+
+// This is a global, so it's visible to the emulator functions
+arguments_t arguments;
 
 // ====================================================================
 // Argp processing
@@ -85,12 +97,12 @@ static struct argp_option options[] = {
    { "rst",            6, "BITNUM", OPTION_ARG_OPTIONAL, "The bit number for rst, blank if unconnected"},
    { "vecrst",         7,    "HEX", OPTION_ARG_OPTIONAL, "The reset vector, black if not known"},
    { "machine",      'm', "MACHINE",                  0, "Enable machine specific behaviour"},
-   { "emulate",      'e',        0,                   0, "Enable emulation, for error checking."},
    { "c02",          'c',        0,                   0, "Enable 65C02 mode."},
+   { "c816",         '8',        0,                   0, "Enable 65C816 mode."},
    { "rockwell",     'r',        0,                   0, "Enable additional rockwell instructions."},
    { "undocumented", 'u',        0,                   0, "Enable undocumented 6502 opcodes (currently incomplete)"},
    { "byte",         'b',        0,                   0, "Byte samples"},
-   { "debug",        'd',  "LEVEL",                   0, "Sets debug level (0 1 or 2)"},
+   { "debug",        'd',  "LEVEL",                   0, "Sets debug level (bitmask)"},
 // Output options
    { "quiet",        'q',        0,                   0, "Set all the show options to off."},
    { "address",      'a',        0,                   0, "Show address of instruction."},
@@ -102,43 +114,19 @@ static struct argp_option options[] = {
    { "trigger",      't',"ADDRESS",                   0, "Trigger on address."},
    { "bbcfwa",       'f',        0,                   0, "Show BBC floating poing work areas."},
    { "bbctube",       8,         0,                   0, "Decode BBC tube protocol"},
-
+   { "vda",           9,  "BITNUM", OPTION_ARG_OPTIONAL, "The bit number for vda, blank if unconnected"},
+   { "vpa",          10,  "BITNUM", OPTION_ARG_OPTIONAL, "The bit number for vpa, blank if unconnected"},
+   { "emul",         11,     "HEX", OPTION_ARG_OPTIONAL, "Initial value E flag in 65816 mode"},
+   { "sp",           12,     "HEX", OPTION_ARG_OPTIONAL, "Initial value Stack Pointer register (65816)"},
+   { "pb",           13,     "HEX", OPTION_ARG_OPTIONAL, "Initial value Program Bank register (65816)"},
+   { "db",           14,     "HEX", OPTION_ARG_OPTIONAL, "Initial value Data Bank register (65816)"},
+   { "dp",           15,     "HEX", OPTION_ARG_OPTIONAL, "Initial value Direct Page register (65816)"},
    { 0 }
 };
 
-struct arguments {
-   int idx_data;
-   int idx_rnw;
-   int idx_sync;
-   int idx_rdy;
-   int idx_phi2;
-   int idx_rst;
-   int vec_rst;
-   int machine;
-   int show_address;
-   int show_hex;
-   int show_instruction;
-   int show_state;
-   int show_bbcfwa;
-   int show_cycles;
-   int show_something;
-   int bbctube;
-   int emulate;
-   int c02;
-   int rockwell;
-   int undocumented;
-   int byte;
-   int debug;
-   int profile;
-   int trigger_start;
-   int trigger_stop;
-   int trigger_skipint;
-   char *filename;
-} arguments;
-
 static error_t parse_opt(int key, char *arg, struct argp_state *state) {
    int i;
-   struct arguments *arguments = state->input;
+   arguments_t *arguments = state->input;
 
    // First, pass argument to the profiler moduler
    profiler_parse_opt(key, arg, state);
@@ -191,14 +179,63 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
    case   8:
       arguments->bbctube = 1;
       break;
-   case 'c':
-      if (arguments->undocumented) {
-         argp_error(state, "undocumented and c02 flags mutually exclusive");
+   case   9:
+      if (arg && strlen(arg) > 0) {
+         arguments->idx_vda = atoi(arg);
+      } else {
+         arguments->idx_vda = -1;
       }
-      arguments->c02 = 1;
+      break;
+   case  10:
+      if (arg && strlen(arg) > 0) {
+         arguments->idx_vpa = atoi(arg);
+      } else {
+         arguments->idx_vpa = -1;
+      }
+      break;
+   case  11:
+      if (arg && strlen(arg) > 0) {
+         arguments->e_flag = strtol(arg, (char **)NULL, 16);
+      } else {
+         arguments->e_flag = -1;
+      }
+      break;
+   case  12:
+      if (arg && strlen(arg) > 0) {
+         arguments->sp_reg = strtol(arg, (char **)NULL, 16);
+      } else {
+         arguments->sp_reg = -1;
+      }
+      break;
+   case  13:
+      if (arg && strlen(arg) > 0) {
+         arguments->pb_reg = strtol(arg, (char **)NULL, 16);
+      } else {
+         arguments->pb_reg = -1;
+      }
+      break;
+   case  14:
+      if (arg && strlen(arg) > 0) {
+         arguments->db_reg = strtol(arg, (char **)NULL, 16);
+      } else {
+         arguments->db_reg = -1;
+      }
+      break;
+   case  15:
+      if (arg && strlen(arg) > 0) {
+         arguments->dp_reg = strtol(arg, (char **)NULL, 16);
+      } else {
+         arguments->dp_reg = -1;
+      }
+      break;
+   case 'c':
+      arguments->cpu_type = CPU_65C02;
+      break;
+   case '8':
+      arguments->cpu_type = CPU_65C816;
       break;
    case 'r':
-      arguments->rockwell = 1;
+      arguments->cpu_type = CPU_65C02_ROCKWELL;
       break;
    case 'm':
       i = 0;
@@ -243,9 +280,6 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
    case 'y':
       arguments->show_cycles = 1;
       break;
-   case 'e':
-      arguments->emulate = 1;
-      break;
    case 'p':
       arguments->profile = 1;
       break;
@@ -266,9 +300,6 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
       }
       break;
    case 'u':
-      if (arguments->c02) {
-         argp_error(state, "undocumented and c02 flags mutually exclusive");
-      }
       arguments->undocumented = 1;
       break;
    case ARGP_KEY_ARG:
@@ -287,157 +318,206 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
 
 static struct argp argp = { options, parse_opt, args_doc, doc, 0, 0, 0 };
 
+
+
 // ====================================================================
 // Analyze a complete instruction
 // ====================================================================
 
-// TODO: all the pc prediction stuff could be pushed down into the emulation
 
-// Predicted PC value
-int pc = -1;
+static void dump_samples(sample_t *sample_q, int n) {
+      for (int i = 0; i < n; i++) {
+         sample_t *sample = sample_q + i;
+         printf("%d %02x ", i, sample->data);
+         switch(sample->type) {
+         case INTERNAL:
+            putchar('I');
+            break;
+         case PROGRAM:
+            putchar('P');
+            break;
+         case DATA:
+            putchar('D');
+            break;
+         case OPCODE:
+            putchar('O');
+            break;
+         case LAST:
+            putchar('L');
+            break;
+         default:
+            putchar('?');
+            break;
+         }
+         putchar(' ');
+         putchar(sample->rnw >= 0 ? '0' + sample->rnw : '?');
+         putchar(' ');
+         putchar(sample->rst >= 0 ? '0' + sample->rst : '?');
+         putchar('\n');
+      }
 
-static void analyze_instruction(int opcode, int op1, int op2, uint64_t accumulator, int intr_seen, int num_cycles, int rst_seen) {
+}
+
+void write_hex1(char *buffer, int value) {
+   *buffer = value + (value < 10 ? '0' : 'A' - 10);
+}
+
+void write_hex2(char *buffer, int value) {
+   write_hex1(buffer++, (value >> 4) & 15);
+   write_hex1(buffer++, (value >> 0) & 15);
+}
+
+void write_hex4(char *buffer, int value) {
+   write_hex1(buffer++, (value >> 12) & 15);
+   write_hex1(buffer++, (value >> 8) & 15);
+   write_hex1(buffer++, (value >> 4) & 15);
+   write_hex1(buffer++, (value >> 0) & 15);
+}
+
+void write_hex6(char *buffer, int value) {
+   write_hex1(buffer++, (value >> 20) & 15);
+   write_hex1(buffer++, (value >> 16) & 15);
+   write_hex1(buffer++, (value >> 12) & 15);
+   write_hex1(buffer++, (value >> 8) & 15);
+   write_hex1(buffer++, (value >> 4) & 15);
+   write_hex1(buffer++, (value >> 0) & 15);
+}
+
+int write_s(char *buffer, const char *s) {
+   int i = 0;
+   while (*s) {
+      *buffer++ = *s++;
+      i++;
+   }
+   return i;
+}
+
+static char *get_fwa(int a_sign, int a_exp, int a_mantissa, int a_round, int a_overflow) {
+   strcpy(fwabuf, default_fwa);
+   int sign     = em->read_memory(a_sign);
+   int exp      = em->read_memory(a_exp);
+   int man1     = em->read_memory(a_mantissa);
+   int man2     = em->read_memory(a_mantissa + 1);
+   int man3     = em->read_memory(a_mantissa + 2);
+   int man4     = em->read_memory(a_mantissa + 3);
+   int round    = em->read_memory(a_round);
+   int overflow = a_overflow >= 0 ? em->read_memory(a_overflow) : -1;
+   if (sign >= 0) {
+      write_hex2(fwabuf + OFFSET_SIGN, sign);
+   }
+   if (exp >= 0) {
+      write_hex2(fwabuf + OFFSET_EXP, exp);
+   }
+   if (man1 >= 0) {
+      write_hex2(fwabuf + OFFSET_MANTISSA + 0, man1);
+   }
+   if (man2 >= 0) {
+      write_hex2(fwabuf + OFFSET_MANTISSA + 2, man2);
+   }
+   if (man3 >= 0) {
+      write_hex2(fwabuf + OFFSET_MANTISSA + 4, man3);
+   }
+   if (man4 >= 0) {
+      write_hex2(fwabuf + OFFSET_MANTISSA + 6, man4);
+   }
+   if (round >= 0) {
+      write_hex2(fwabuf + OFFSET_ROUND, round);
+   }
+   if (overflow >= 0) {
+      write_hex2(fwabuf + OFFSET_OVERFLOW, overflow);
+   }
+   if (sign >= 0 && exp >= 0 && man1 >= 0 && man2 >= 0 && man3 >= 0 && man4 >= 0 && round >= 0) {
+
+      // Real numbers are held in binary floating point format. In the
+      // default (40-bit) mode the mantissa is held as a 4 byte binary
+      // fraction in sign and magnitude format. Bit 7 of the MSB of
+      // the mantissa is the sign bit. When working out the value of
+      // the mantissa, this bit is assumed to be 1 (a decimal value of
+      // 0.5). The exponent is held as a single byte in 'excess 127'
+      // format. In other words, if the actual exponent is zero, the
+      // value stored in the exponent byte is 127.
+
+      // Build up a 32 bit mantissa
+      uint64_t mantissa = man1;
+      mantissa = (mantissa << 8) + man2;
+      mantissa = (mantissa << 8) + man3;
+      mantissa = (mantissa << 8) + man4;
+
+      // Extend this to 40 bits with the rounding byte
+      mantissa = (mantissa << 8) + round;
+
+      // Combine with the exponent
+      double value = ((double) mantissa) * pow(2.0, exp - 128 - 40);
+      // Take account of the sign
+      if (sign & 128) {
+         value = -value;
+      }
+      // Print it to the fwabuf
+      sprintf(fwabuf + OFFSET_VALUE, "%-+15.8E", value);
+   }
+   return fwabuf;
+}
+
+
+static int analyze_instruction(sample_t *sample_q, int num_samples, int rst_seen) {
 
    static int interrupt_depth = 0;
    static int skipping_interrupted = 0;
    static int triggered = 0;
 
-   int offset;
-   char target[16];
+   int intr_seen = em->match_interrupt(sample_q, num_samples);
 
-   // lookup the entry for the instruction
-   InstrType *instr = &instr_table[opcode];
+   int num_cycles;
 
-   // For instructions that push the current address to the stack we
-   // can use the stacked address to determine the current PC
-   int newpc = -1;
-   if (rst_seen || (intr_seen && opcode != 0x00)) {
-      // IRQ/NMI/RST
-      newpc = (accumulator >> 24) & 0xffff;
-   } else if (opcode == 0x20) {
-      // JSR
-      newpc = ((accumulator >> 8) - 2) & 0xffff;
-   } else if (opcode == 0x00) {
-      // BRK
-      newpc = ((accumulator >> 24) - 2) & 0xffff;
+   if (rst_seen > 0) {
+      num_cycles = rst_seen;
+   } else {
+      num_cycles = em->count_cycles(sample_q, intr_seen);
    }
 
-   // Sanity check the current pc prediction has not gone awry
-   if (newpc >= 0) {
-      if (pc >= 0 && pc != newpc) {
-         printf("pc: prediction failed at %04X old pc was %04X\n", newpc, pc);
-         pc = newpc;
-      }
+   // Deal with partial final instruction
+   if (num_samples <= num_cycles || num_cycles == 0) {
+      return num_samples;
    }
 
-   // Force the pc to don't case fore the reset cycle (makes test log more consistent)
-   if (rst_seen) {
-      pc = -1;
+   if (arguments.debug & 1) {
+      dump_samples(sample_q, num_cycles);
    }
+
+   instruction_t instruction;
+
+   int oldpc = em->get_PC();
+   int oldpb = em->get_PB();
 
    if (rst_seen) {
-      // Handlea reset
-      if (do_emulate) {
-         em_reset();
-      }
-   } else if (intr_seen && opcode != 0) {
+      // Handle a reset
+      em->reset(sample_q, num_cycles, &instruction);
+   } else if (intr_seen) {
       // Handle an interrupt
-      if (do_emulate) {
-         em_interrupt((accumulator >> 16) & 0xff, pc);
-      }
+      em->interrupt(sample_q, num_cycles, &instruction);
    } else {
       // Handle a normal instruction
-      // Emulate the instruction
-      if (do_emulate) {
-         if (instr->emulate) {
-            int operand;
-            if (instr->optype == RMWOP) {
-               // e.g. <opcode> <op1> <op2> <read> <write> <write>
-               // Want to pick off the read
-               operand = (accumulator >> 16) & 0xff;
-            } else if (instr->optype == BRANCHOP) {
-               // the operand is true if branch taken
-               operand = (num_cycles != 2);
-            } else if (opcode == 0x00) {
-               // BRK: the operand is the data pushed to the stack (PCH, PCL, P)
-               // <opcode> <op1> <write pch> <write pcl> <write p> <read rst> <read rsth>
-               operand = (accumulator >> 16) & 0xffffff;
-            } else if (opcode == 0x20) {
-               // JSR: the operand is the data pushed to the stack (PCH, PCL)
-               // <opcode> <op1> <read dummy> <write pch> <write pcl> <op2>
-               operand = (accumulator >> 8) & 0xffff;
-            } else if (opcode == 0x40) {
-               // RTI: the operand is the data pulled from the stack (P, PCL, PCH)
-               // <opcode> <op1> <read dummy> <read p> <read pcl> <read pch>
-               operand = accumulator & 0xffffff;
-            } else if (opcode == 0x60) {
-               // RTS: the operand is the data pulled from the stack (PCL, PCH)
-               // <opcode> <op1> <read dummy> <read pcl> <read pch>
-               operand = (accumulator >> 8) & 0xffff;
-            } else if (instr->mode == IMM) {
-               // Immediate addressing mode: the operand is the 2nd byte of the instruction
-               operand = op1;
-            } else if (instr->decimalcorrect && (em_get_D() == 1)) {
-               // read operations on the C02 that have an extra cycle added
-               operand = (accumulator >> 8) & 0xff;
-            } else if (instr->optype == TSBTRBOP) {
-               // For TSB/TRB, <opcode> <op1> <read> <dummy> <write> the operand is the <read>
-               operand = (accumulator >> 16) & 0xff;
-            } else {
-               // default to using the last bus cycle as the operand
-               operand = accumulator & 0xff;
-            }
+      em->emulate(sample_q, num_cycles, &instruction);
+   }
 
-            // For instructions that read or write memory, we need to work out the effective address
-            // Note: not needed for stack operations, as S is used directly
-            int ea = -1;
-            int index;
-            switch (instr->mode) {
-            case ZP:
-               ea = op1;
-               break;
-            case ZPX:
-            case ZPY:
-               index = instr->mode == ZPX ? em_get_X() : em_get_Y();
-               if (index >= 0) {
-                  ea = (op1 + index) & 0xff;
-               }
-               break;
-            case INDY:
-               // <opcpde> <op1> <addrlo> <addrhi> [ <page crossing>] <<operand> [ <extra cycle in dec mode> ]
-               index = em_get_Y();
-               if (index >= 0) {
-                  ea = accumulator >> (8 * (num_cycles - 4));
-                  ea = ((ea & 0xFF00) >> 8) | ((ea & 0x00FF) << 8);
-                  ea = (ea + index) & 0xffff;
-               }
-               break;
-            case INDX:
-               // <opcpde> <op1> <dummy> <addrlo> <addrhi> <operand> [ <extra cycle in dec mode> ]
-               ea = accumulator >> (8 * (num_cycles - 5));
-               ea = ((ea & 0xFF00) >> 8) | ((ea & 0x00FF) << 8);
-               break;
-            case IND:
-               // <opcpde> <op1> <addrlo> <addrhi> <operand> [ <extra cycle in dec mode> ]
-               ea = accumulator >> (8 * (num_cycles - 4));
-               ea = ((ea & 0xFF00) >> 8) | ((ea & 0x00FF) << 8);
-               break;
-            case ABS:
-               ea = op2 << 8 | op1;
-               break;
-            case ABSX:
-            case ABSY:
-               index = instr->mode == ABSX ? em_get_X() : em_get_Y();
-               if (index >= 0) {
-                  ea = ((op2 << 8 | op1) + index) & 0xffff;
-               }
-               break;
-            default:
-               break;
-            }
+   // Sanity check the pc prediction has not gone awry
+   // (e.g. in JSR the emulation can use the stacked PC)
 
-            instr->emulate(operand, ea);
+   int opcode = instruction.opcode;
+   int pb = instruction.pb;
+   int pc = instruction.pc;
+
+   if (c816) {
+      if (pb >= 0) {
+         if (oldpb >= 0 && oldpb != pb) {
+            printf("pb: prediction failed at %02X old pb was %02X\n", pb, oldpb);
          }
+      }
+   }
+
+   if (pc >= 0) {
+      if (oldpc >= 0 && oldpc != pc) {
+         printf("pc: prediction failed at %04X old pc was %04X\n", pc, oldpc);
       }
    }
 
@@ -452,7 +532,7 @@ static void analyze_instruction(int opcode, int op1, int op2, uint64_t accumulat
       if (interrupt_depth == 0) {
          skipping_interrupted = 0;
       }
-      if (intr_seen && opcode != 0) {
+      if (intr_seen) {
          interrupt_depth++;
          skipping_interrupted = 1;
       } else if (interrupt_depth > 0 && opcode == 0x40) {
@@ -460,626 +540,232 @@ static void analyze_instruction(int opcode, int op1, int op2, uint64_t accumulat
       }
    }
 
-   if (arguments.profile && triggered && !skipping_interrupted && (!intr_seen || opcode == 0)) {
-      profiler_profile_instruction(pc, opcode, op1, op2, num_cycles);
+   if (arguments.profile && triggered && !skipping_interrupted && !intr_seen) {
+      // TODO: refactor profiler to take instruction_t *
+      profiler_profile_instruction(instruction.pc, instruction.opcode, instruction.op1, instruction.op2, num_cycles);
    }
 
-   int fail = em_get_and_clear_fail();
+   int fail = em->get_and_clear_fail();
+
+   // Try to minimise the calls to printf as these are quite expensive
+
+   char *bp = disbuf;
 
    if ((fail | arguments.show_something) && triggered && !skipping_interrupted) {
       int numchars = 0;
       // Show address
       if (fail || arguments.show_address) {
-         if (pc < 0) {
-            printf("???? : ");
-         } else {
-            printf("%04X : ", pc);
+         if (c816) {
+            if (pb < 0) {
+               *bp++ = '?';
+               *bp++ = '?';
+            } else {
+               write_hex2(bp, pb);
+               bp += 2;
+            }
          }
+         if (pc < 0) {
+            *bp++ = '?';
+            *bp++ = '?';
+            *bp++ = '?';
+            *bp++ = '?';
+         } else {
+            write_hex4(bp, pc);
+            bp += 4;
+         }
+         *bp++ = ' ';
+         *bp++ = ':';
+         *bp++ = ' ';
       }
       // Show hex bytes
       if (fail || arguments.show_hex) {
-         if (rst_seen) {
-            printf("         : ");
-         } else if (intr_seen && opcode != 0) {
-            printf("         : ");
-         } else {
-            if (instr->len == 1) {
-               printf("%02X       : ", opcode);
-            } else if (instr->len == 2) {
-               printf("%02X %02X    : ", opcode, op1);
+         for (int i = 0; i < (c816 ? 4 : 3); i++) {
+            if (rst_seen || intr_seen || i > instruction.opcount) {
+               *bp++ = ' ';
+               *bp++ = ' ';
             } else {
-               printf("%02X %02X %02X : ", opcode, op1, op2);
+               switch (i) {
+               case 0: write_hex2(bp, opcode         ); break;
+               case 1: write_hex2(bp, instruction.op1); break;
+               case 2: write_hex2(bp, instruction.op2); break;
+               case 3: write_hex2(bp, instruction.op3); break;
+               }
+               bp += 2;
             }
+            *bp++ = ' ';
          }
+         *bp++ = ':';
+         *bp++ = ' ';
       }
+
       // Show instruction disassembly
       if (fail || arguments.show_something) {
          if (rst_seen) {
-            numchars = printf("RESET !!");
-         } else if (intr_seen && opcode != 0) {
-            numchars = printf("INTERRUPT !!");
+            numchars = write_s(bp, "RESET !!");
+         } else if (intr_seen) {
+            numchars = write_s(bp, "INTERRUPT !!");
          } else {
-            const char *mnemonic = instr->mnemonic;
-            const char *fmt = instr->fmt;
-            switch (instr->mode) {
-            case IMP:
-            case IMPA:
-               numchars = printf(fmt, mnemonic);
-               break;
-            case BRA:
-               // Calculate branch target using op1 for normal branches
-               offset = (int8_t) op1;
-               if (pc < 0) {
-                  if (offset < 0) {
-                     sprintf(target, "pc-%d", -offset);
-                  } else {
-                     sprintf(target,"pc+%d", offset);
-                  }
-               } else {
-                  sprintf(target, "%04X", pc + 2 + offset);
-               }
-               numchars = printf(fmt, mnemonic, target);
-               break;
-            case ZPR:
-               // Calculate branch target using op2 for BBR/BBS
-               offset = (int8_t) op2;
-               if (pc < 0) {
-                  if (offset < 0) {
-                     sprintf(target, "pc-%d", -offset);
-                  } else {
-                     sprintf(target,"pc+%d", offset);
-                  }
-               } else {
-                  sprintf(target, "%04X", pc + 3 + offset);
-               }
-               numchars = printf(fmt, mnemonic, op1, target);
-               break;
-            case IMM:
-            case ZP:
-            case ZPX:
-            case ZPY:
-            case INDX:
-            case INDY:
-            case IND:
-               numchars = printf(fmt, mnemonic, op1);
-               break;
-            case ABS:
-            case ABSX:
-            case ABSY:
-            case IND16:
-            case IND1X:
-               numchars = printf(fmt, mnemonic, op1, op2);
-               break;
-            }
+            numchars = em->disassemble(bp, &instruction);
          }
+         bp += numchars;
       }
+
       // Pad if there is more to come
       if (fail || arguments.show_cycles || arguments.show_state || arguments.show_bbcfwa) {
          // Pad opcode to 14 characters, to match python
          while (numchars++ < 14) {
-            printf(" ");
+            *bp++ = ' ';
          }
       }
       // Show cycles (don't include with fail as it is inconsistent depending on whether rdy is present)
       if (arguments.show_cycles) {
-         printf(" : %d", num_cycles);
+         *bp++ = ' ';
+         *bp++ = ':';
+         *bp++ = ' ';
+         // No instruction is more then 8 cycles
+         write_hex1(bp++, num_cycles);
       }
       // Show register state
       if (fail || arguments.show_state) {
-         printf(" : %s", em_get_state());
+         *bp++ = ' ';
+         *bp++ = ':';
+         *bp++ = ' ';
+         bp = em->get_state(bp);
       }
       // Show BBC floating point work area FWA, FWB
       if (arguments.show_bbcfwa) {
-         printf(" : FWA %s", em_get_fwa(0x2e, 0x30, 0x31, 0x35, 0x2f));
-         printf(" : FWB %s", em_get_fwa(0x3b, 0x3c, 0x3d, 0x41,   -1));
+         bp += sprintf(bp, " : FWA %s", get_fwa(0x2e, 0x30, 0x31, 0x35, 0x2f));
+         bp += sprintf(bp, " : FWB %s", get_fwa(0x3b, 0x3c, 0x3d, 0x41,   -1));
       }
       // Show any errors
       if (fail) {
-         printf(" prediction failed");
+         bp += write_s(bp, " prediction failed");
       }
       // End the line
-      printf("\n");
+      *bp++ = 0;
+      puts(disbuf);
+
    }
 
-   // Look for control flow changes and update the PC
-   if (opcode == 0x40 || opcode == 0x00 || opcode == 0x6c || opcode == 0x7c || intr_seen || rst_seen) {
-      // RTI, BRK, INTR, JMP (ind), JMP (ind, X), IRQ/NMI/RST
-      pc = ((accumulator & 0xFF00) >> 8) | ((accumulator & 0x00FF) << 8);
-   } else if (opcode == 0x20 || opcode == 0x4c) {
-      // JSR abs, JMP abs
-      pc = op2 << 8 | op1;
-   } else if (opcode == 0x60) {
-      // RTS
-      pc = ((((accumulator & 0xff0000) >> 16) | (accumulator & 0xff00)) + 1) & 0xffff;
-   } else if (pc < 0) {
-      // PC value is not known yet, everything below this point is relative
-      pc = -1;
-   } else if (opcode == 0x80) {
-      // BRA
-      pc += ((int8_t)(op1)) + 2;
-      pc &= 0xffff;
-   } else if (arguments.c02 && arguments.rockwell && ((opcode & 0x0f) == 0x0f) && (num_cycles != 5)) {
-      // BBR/BBS: op2 if taken
-      pc += ((int8_t)(op2)) + 3;
-      pc &= 0xffff;
-   } else if ((opcode & 0x1f) == 0x10 && num_cycles != 2) {
-      // BXX: op1 if taken
-      pc += ((int8_t)(op1)) + 2;
-      pc &= 0xffff;
-   } else {
-      // Otherwise, increment pc by length of instuction
-      pc += instr->len;
-      pc &= 0xffff;
-   }
+
+   return num_cycles;
 }
 
 // ====================================================================
-// Sync-less bus cycle decoder
+// Generic instruction decoder
 // ====================================================================
 
-void decode_cycle_without_sync(int *bus_data_q, int *pin_rnw_q, int *pin_rst_q) {
+// This stage is mostly about cleaning coming out of reset in all cases
+//
+//        Rst Sync
+//
+// Case 1:  ?   ?  : search for heuristic at n, n+1, n+2 - consume n+2 cycles
+// Case 2:  ?  01  : search for heuristic at 5, 6, 7 - consume 7 ctcles
+// Case 3: 01   ?  : dead reconning; 8 or 9 depending on the cpu type
+// Case 4: 01  01  : mark first instruction after rst stable
+//
 
-   // Count of the 6502 bus cycles
-   static int cyclenum             = 0;
+int decode_instruction(sample_t *sample_q, int num_samples) {
+   static int rst_seen = 0;
 
-   // Cycle count of the last sync, so we know the instruction cycle count
-   static int last_cyclenum        = 0;
-
-   // State to decode the 6502 bus activity
-   static int opcode               = -1;
-   static int op1                  = 0;
-   static int op2                  = 0;
-   static uint64_t accumulator     = 0;
-   static int bus_cycle            = 0;
-   static int cycle_count          = 0;
-   static int opcount              = 0;
-   static int rst_seen             = 0;
-   static int intr_seen            = 0;
-   static int mhz1_phase           = 0;
-
-   int bus_data = *bus_data_q;
-   int pin_rnw = *pin_rnw_q;
-   int pin_rst = *pin_rst_q;
-
-   // Detect a rising edge of reset
-   if (arguments.idx_rst >= 0) {
-      if (pin_rst == 0) {
-         if (*(pin_rst_q + 1) == 1) {
-            cycle_count = arguments.c02 ? 7 : 8;
-            bus_cycle = -1;
-            opcode = 0;
-            rst_seen = 1;
-         }
-         return;
-      }
-   } else {
-      // no reset line
-      if ((bus_data_q[0] + (bus_data_q[1] << 8)) == (arguments.vec_rst & 0xFFFF)) {
-         int rst_opcode = (arguments.vec_rst >> 16) & 0xff;
-         if (!rst_opcode || (bus_data_q[2] == rst_opcode)) {
-            cycle_count = 1;
-            bus_cycle = -1;
-            opcode = 0;
-            rst_seen = 1;
-         }
-      }
+   // Skip any samples where RST is asserted (active low)
+   if (sample_q[0].rst == 0) {
+      rst_seen = 1;
+      return 1;
    }
 
-   // TODO: Find a more correct way of starting up!
-   InstrType *instr = &instr_table[opcode >= 0 ? opcode : 0xEA];
-
-   if (bus_cycle == 1 && opcount >= 1) {
-      op1 = bus_data;
+   // If the first sample is not an SYNC, then drop the sample
+   if (sample_q->type != OPCODE && sample_q->type != UNKNOWN) {
+      return 1;
    }
 
-   if (bus_cycle == ((opcode == 0x20) ? 5 : ((opcode & 0x0f) == 0x0f) ? 4 : 2) && opcount >= 2) {
-      op2 = bus_data;
-   }
+   // Flag to indicate the sample type is missing (sync/vda/vpa unconnected)
+   int notype = sample_q[0].type == UNKNOWN;
 
-   if (!intr_seen && !rst_seen) {
-
-      // Account for extra cycle in ADC/SBC in decimal mode in C02
-      if (arguments.c02 && instr->decimalcorrect && bus_cycle == 1 && em_get_D() == 1) {
-         cycle_count++;
-      }
-
-      // Account for extra cycle in a page crossing in (indirect), Y
-      if (bus_cycle == 4) {
-         // Applies to INDY, but need to exclude stores
-         if ((instr->mode == INDY) && (instr->optype == READOP)) {
-            int index = em_get_Y();
-            if (index >= 0) {
-               int base = ((accumulator & 0xFF00) >> 8) | ((accumulator & 0x00FF) << 8);
-               if ((base & 0xff00) != ((base + index) & 0xff00)) {
-                  cycle_count++;
-               }
-            }
-         }
-      }
-
-      // Account for extra cycle in a page crossing in absolute indexed
-      if (bus_cycle == 2) {
-         // Applies to ABSX and ABSY, but need to exclude stores
-         if (((instr->mode == ABSX) || (instr->mode == ABSY)) && (instr->optype == READOP)) {
-            // 6502:  Need to exclude ASL/ROL/LSR/ROR/DEC/INC, which are 7 cycles regardless
-            // 65C02: Need to exclude DEC/INC, which are 7 cycles regardless
-            if ((opcode != 0xDE) && (opcode != 0xFE) && (arguments.c02 || ((opcode != 0x1E) && (opcode != 0x3E) && (opcode != 0x5E) && (opcode != 0x7E)))) {
-               int index = (instr->mode == ABSX) ? em_get_X() : em_get_Y();
-               if (index >= 0) {
-                  int base = op1 + (op2 << 8);
-                  if ((base & 0xff00) != ((base + index) & 0xff00)) {
-                     cycle_count++;
-                  }
-               }
-            }
-         }
-      }
-
-      // Account for extra cycles in BBR/BBS
-      //
-      // Example: BBR0, $50, +6
-      // 0 8f 1 1 1 <opcode>
-      // 1 50 1 0 1 <op1> i.e. ZP address
-      // 2 01 1 0 1 <mem rd>
-      // 3 01 1 0 1 <mem rd>
-      // 4 06 1 0 1 <op2> i.e.
-      // 5 20 1 0 1 (<branch taken penalty>)
-      // 6          (<page crossed penalty>)
-      //
-
-      if (bus_cycle == 4) {
-         if (arguments.c02 && arguments.rockwell && (opcode & 0x0f) == 0x0f) {
-            int operand = (accumulator >> 8) & 0xff;
-            // invert operand for BBR
-            if (opcode <= 0x80) {
-               operand ^= 0xff;
-            }
-            int bit = (opcode >> 4) & 7;
-            // Figure out if the branch was taken
-            if (operand & (1 << bit)) {
-               // A taken bbr/bbs branch is 6 cycles, not 5
-               cycle_count = 6;
-               // A taken bbr/bbs branch that crosses a page boundary is 7 cycles
-               if (pc >= 0) {
-                  int target =  (pc + 3) + ((int8_t)(op2));
-                  if ((target & 0xFF00) != ((pc + 3) & 0xff00)) {
-                     cycle_count = 7;
-                  }
-               }
-            }
-         }
-      }
-
-      // Account for extra cycles in a branch
-      if (bus_cycle == 1) {
-         if (((opcode & 0x1f) == 0x10) || (opcode == 0x80)) {
-            // Default to backards branches taken, forward not taken
-            int taken = ((int8_t)op1) < 0;
-            switch (opcode) {
-            case 0x10: // BPL
-               if (em_get_N() >= 0) {
-                  taken = !em_get_N();
-               }
-               break;
-            case 0x30: // BMI
-               if (em_get_N() >= 0) {
-                  taken = em_get_N();
-               }
-               break;
-            case 0x50: // BVC
-               if (em_get_V() >= 0) {
-                  taken = !em_get_V();
-               }
-               break;
-            case 0x70: // BVS
-               if (em_get_V() >= 0) {
-                  taken = em_get_V();
-               }
-               break;
-            case 0x80: // BRA
-               taken = 1;
-               break;
-            case 0x90: // BCC
-               if (em_get_C() >= 0) {
-                  taken = !em_get_C();
-               }
-               break;
-            case 0xB0: // BCS
-               if (em_get_C() >= 0) {
-                  taken = em_get_C();
-               }
-               break;
-            case 0xD0: // BNE
-               if (em_get_Z() >= 0) {
-                  taken = !em_get_Z();
-               }
-               break;
-            case 0xF0: // BEQ
-               if (em_get_Z() >= 0) {
-                  taken = em_get_Z();
-               }
+   if (arguments.idx_rst < 0) {
+      // We use a heuristic, based on what we expect to see on the data
+      // bus in cycles 5, 6 and 7, i.e. RSTVECL, RSTVECH, RSTOPCODE
+      int veclo  = (arguments.vec_rst      ) & 0xff;
+      int vechi  = (arguments.vec_rst >>  8) & 0xff;
+      int opcode = (arguments.vec_rst >> 16) & 0xff;
+      if (notype) {
+         // No Sync, so search for heurisic anywhere in the sample queue
+         for (int i = 0; i <= num_samples - 3; i++) {
+            if (sample_q[i].data == veclo && sample_q[i + 1].data == vechi && (!opcode || sample_q[i + 2].data == opcode)) {
+               rst_seen = i + 2;
                break;
             }
-            if (taken) {
-               // A taken branch is 3 cycles, not 2
-               cycle_count = 3;
-               // A taken branch that crosses a page boundary is 4 cycle
-               if (pc >= 0) {
-                  int target =  (pc + 2) + ((int8_t)(op1));
-                  if ((target & 0xFF00) != ((pc + 2) & 0xff00)) {
-                     cycle_count = 4;
-                  }
-               }
-            }
-         }
-      }
-
-      // Master specific behaviour to remain in sync if rdy is not available
-      if ((arguments.machine == MACHINE_MASTER) && (arguments.idx_rdy < 0)) {
-         if ((bus_cycle == 3) && (instr->len == 3)) {
-            if ((op2 == 0xfc) ||                 // &FC00-&FCFF
-                (op2 == 0xfd) ||                 // &FD00-&FDFF
-                (op2 == 0xfe && (
-                   ((op1 & 0xE0) == 0x00) ||     // &FE00-&FE1F
-                   ((op1 & 0xC0) == 0x40) ||     // &FE40-&FE7F
-                   ((op1 & 0xE0) == 0x80) ||     // &FE80-&FE9F
-                   ((op1 & 0xE0) == 0xC0)        // &FEC0-&FEDF
-                   ))) {
-               // Use STA/STX/STA to determine 1MHz clock phase
-               if (opcode == 0x8C || opcode == 0x8D || opcode == 0x8E) {
-                  if (*(bus_data_q + 1) == bus_data) {
-                     int new_phase;
-                     if (*(bus_data_q + 2) == bus_data) {
-                        new_phase = 1;
-                     } else {
-                        new_phase = 0;
-                     }
-                     if (mhz1_phase != new_phase) {
-                        // printf("correcting 1MHz phase\n");
-                        mhz1_phase = new_phase;
-                     }
-                  } else {
-                     printf("fail: 1MHz access not extended as expected\n");
-                  }
-               }
-               // Correct cycle count based on expected cycle stretching behaviour
-               if (opcode == 0x9D) {
-                  // STA abs, X which has an unfortunate dummy cycle
-                  cycle_count += 2 + mhz1_phase;
-               } else {
-                  cycle_count += 1 + mhz1_phase;
-               }
-            }
-         }
-      }
-
-      // An interrupt sequence looks like:
-      // 0 <opcode>            Rd
-      // 1 <opcode>            Rd // address not incremented
-      // 2 <return address hi> Wr
-      // 3 <return address lo> Wr
-      // 4 <flags>             Wr
-      // 5 <vector lo>         Rd
-      // 6 <vector hu>         Rd
-      // 7 <opcode>            Rd
-
-      // Detect interrupts as early as possible...
-      if (arguments.idx_rnw >= 0) {
-         if ((bus_cycle == 2) && (pin_rnw == 0) && (*(pin_rnw_q + 1) == 0) && (*(pin_rnw_q + 2) == 0)) {
-            cycle_count = 7;
-            intr_seen = 1;
          }
       } else {
-         if ((bus_cycle == 2) && (bus_data_q[0] == ((pc >> 8) & 0xff)) && (bus_data_q[1] == (pc & 0xff))) {
-            // Now test unused flag is 1, B is 0, and all other known flags match
-            if (((bus_data_q[2] & 0x30) == 0x20) && !compare_NVDIZC(bus_data_q[2])) {
-               cycle_count = 7;
-               intr_seen = 1;
-            }
+         // Sync, so check heurisic at a specific offset in the sample queue
+         if (sample_q[5].data == veclo && sample_q[6].data == vechi && (!opcode || sample_q[7].data == opcode) && sample_q[7].type == OPCODE) {
+            rst_seen = 7;
+         }
+      }
+   } else if (rst_seen) {
+      // First, make sure rst is stable
+      for (int i = 1; i < num_samples; i++) {
+         if (sample_q[i].rst == 0) {
+            return i + 1;
+         }
+      }
+      if (notype) {
+         // Do this by dead reconning
+         rst_seen = (arguments.cpu_type == CPU_65C02 || arguments.cpu_type == CPU_65C02_ROCKWELL) ? 8 : 9;
+         // We could also check the vector
+      } else {
+         if (sample_q[7].type == OPCODE) {
+            rst_seen = 7;
+         } else {
+            printf("Instruction after rst /= 7 cycles\n");
+            rst_seen = 0;
          }
       }
    }
 
-   // Master specific behaviour to remain in sync if rdy is not available
-   if ((arguments.machine == MACHINE_MASTER) && (arguments.idx_rdy < 0)) {
-      // Toggle the phase every cycle
-      mhz1_phase = 1 - mhz1_phase;
+   // Decode the instruction
+   int num_cycles = analyze_instruction(sample_q, num_samples, rst_seen);
+
+   // And reset rst_seen for the next reset
+   if (rst_seen) {
+      rst_seen = 0;
    }
 
-   if (bus_cycle == cycle_count) {
-      // Analyze the  previous instrucution
-      if (opcode >= 0) {
-         analyze_instruction(opcode, op1, op2, accumulator, intr_seen, cyclenum - last_cyclenum, rst_seen);
-         rst_seen = 0;
-         intr_seen = 0;
-      }
-      last_cyclenum  = cyclenum;
-
-      // Re-initialize the state for the new instruction
-      opcode            = bus_data;
-      op1               = 0;
-      op2               = 0;
-      accumulator       = 0;
-      bus_cycle         = 0;
-      cycle_count       = instr_table[opcode].cycles ;
-      opcount           = instr_table[opcode].len - 1;
-
-   } else {
-
-      accumulator = (accumulator << 8) | bus_data;
-
-   }
-
-   if (arguments.debug >= 1) {
-      printf("%d %02x", bus_cycle, bus_data);
-      if (arguments.idx_rnw >= 0) {
-         printf(" %d", pin_rnw);
-      }
-      if (arguments.idx_rst >= 0) {
-         printf(" %d", pin_rst);
-      }
-      printf("\n");
-   }
-
-   bus_cycle++;
-
-   // Increment the cycle number (used only to detect taken branches)
-   cyclenum++;
-}
-
-void lookahead_decode_cycle_without_sync(int bus_data, int pin_rnw, int pin_rst) {
-   static int bus_data_q[DEPTH];
-   static int pin_rnw_q[DEPTH];
-   static int pin_rst_q[DEPTH];
-   static int fill = 0;
-
-   bus_data_q[fill] = bus_data;
-   pin_rnw_q[fill] = pin_rnw;
-   pin_rst_q[fill] = pin_rst;
-   if (fill < DEPTH - 1) {
-      fill++;
-   } else {
-      decode_cycle_without_sync(bus_data_q, pin_rnw_q, pin_rst_q);
-      for (int i = 0; i < DEPTH - 1; i++) {
-         bus_data_q[i] = bus_data_q[i + 1];
-         pin_rnw_q[i] = pin_rnw_q[i + 1];
-         pin_rst_q[i] = pin_rst_q[i + 1];
-      }
-   }
+   return num_cycles;
 }
 
 // ====================================================================
-// Sync-based bus cycle decoder
+// Queue a small number of samples so the decoders can lookahead
 // ====================================================================
 
-void decode_cycle_with_sync(int bus_data, int pin_rnw, int pin_sync, int pin_rst) {
+void queue_sample(sample_t *sample) {
+   static sample_t sample_q[DEPTH];
+   static int index = 0;
 
-   // Count of the 6502 bus cycles
-   static int cyclenum             = 0;
+   sample_q[index++] = *sample;
 
-   // Cycle count of the last sync, so we know the instruction cycle count
-   static int last_cyclenum        = 0;
-
-   // State to decode the 6502 bus activity
-   static int opcode               = -1;
-   static int opcount              = 0;
-   static int op1                  = 0;
-   static int op2                  = 0;
-   static int bus_cycle            = 0;
-   static int rst_state            = 0;
-   static int intr_state           = 0;
-   static uint64_t accumulator     = 0;
-   static int last_pin_rst         = 1;
-
-   // TODO, sync based decoder probably should fall back to testing the
-   // reset vector if rst is not connected.
-
-   if (pin_rst == 1) {
-
-      if (arguments.idx_rst >= 0) {
-         // If we have the RST pin connected, we use it's value directly
-         if (last_pin_rst == 0) {
-            rst_state = 3;
+   if (sample->type == LAST) {
+      // To prevent edge condition, don't advertise the LAST marker
+      index--;
+      // Drain the queue when the LAST marker is seen
+      while (index > 1) {
+         int consumed = decode_instruction(sample_q, index);
+         for (int i = 0; i < DEPTH - consumed; i++) {
+            sample_q[i] = sample_q[i + consumed];
          }
-      } else {
-         // If not, then we use a heuristic, based on what we expect to see on the data
-         // bus in cycles 5, 6 and 7, i.e. RSTVECL, RSTVECH, RSTOPCODE
-         if ((bus_cycle == 5) && (bus_data == (arguments.vec_rst & 0xff))) {
-            // Matched RSTVECL
-            rst_state++;
-         }
-         if ((bus_cycle == 6) && (bus_data == ((arguments.vec_rst >> 8) & 0xff))) {
-            // Matched RSTVECH
-            rst_state++;
-         }
-         if ((bus_cycle == 7) && ((bus_data == ((arguments.vec_rst >> 16) & 0xff)) || (((arguments.vec_rst >> 16) & 0xff) == 0))) {
-            // Matched RSTOPCODE if none zerl
-            rst_state++;
-         }
+         index -= consumed;
       }
-
-      // Write count is only used to determine if an interrupt has occurred
-      if (arguments.idx_rnw >= 0) {
-         // If we have the RNW pin connected, we use it's value directly
-         if (pin_rnw == 0) {
-            if (bus_cycle == 2 || bus_cycle == 3 || bus_cycle == 4) {
-               intr_state++;
-            }
+   } else {
+      // Else queue the samples
+      // If the queue is full, then pass on to the decoder
+      if (index == DEPTH) {
+         int consumed = decode_instruction(sample_q, index);
+         for (int i = 0; i < DEPTH - consumed; i++) {
+            sample_q[i] = sample_q[i + consumed];
          }
-      } else {
-         // If not, then we use a heuristic, based on what we expect to see on the data
-         // bus in cycles 2, 3 and 4, i.e. PCH, PCL, PSW
-         // (It's unlikely sync would be connected but rnw not, but lets try to cope)
-         if ((bus_cycle == 2) && (bus_data == ((pc >> 8) & 0xff))) {
-            // Matched PCH
-            intr_state++;
-         }
-         if ((bus_cycle == 3) && (bus_data == (pc & 0xff))) {
-            // Matched PCL
-            intr_state++;
-         }
-         // Now test unused flag is 1, B is 0
-         if ((bus_cycle == 4) && ((bus_data & 0x30) == 0x20)) {
-            // Finally test all other known flags match
-            if (!compare_NVDIZC(bus_data)) {
-               // Matched PSW = NV-BDIZC
-               intr_state++;
-            }
-         }
+         index -= consumed;
       }
-
-      if (pin_sync == 1) {
-
-         // Sync indicates the start of a new instruction, the following variables pertain to the previous instruction
-         // opcode, op1, op2, accumulator, intr_state, operand
-
-         // Analyze the  previous instrucution
-         if (opcode >= 0) {
-            analyze_instruction(opcode, op1, op2, accumulator, intr_state == 3, cyclenum - last_cyclenum, rst_state == 3);
-            rst_state = 0;
-         }
-         last_cyclenum  = cyclenum;
-
-         bus_cycle         = 0;
-         opcode            = bus_data;
-         opcount           = instr_table[opcode].len - 1;
-         intr_state       = 0;
-         accumulator       = 0;
-
-      } else {
-
-         if (bus_cycle == 1 && opcount >= 1) {
-            op1 = bus_data;
-         }
-
-         if (bus_cycle == ((opcode == 0x20) ? 5 : ((opcode & 0x0f) == 0x0f) ? 4 : 2) && opcount >= 2 && intr_state < 3) {
-            // JSR     is <opcode> <op1> <dummp stack rd> <stack wr> <stack wr> <op2>
-            // BBR/BBS is <opcode> <op1> <zp> <dummy> <op2> (<branch taken penalty>) (<page cross penatly)
-            op2 = bus_data;
-         }
-
-         accumulator = (accumulator <<  8) | bus_data;
-      }
-
-      if (arguments.debug >= 1) {
-         printf("%d %02x %d", bus_cycle, bus_data, pin_sync);
-         if (arguments.idx_rnw >= 0) {
-            printf(" %d", pin_rnw);
-         }
-         if (arguments.idx_rst >= 0) {
-            printf(" %d", pin_rst);
-         }
-         printf("\n");
-      }
-
-      bus_cycle++;
    }
-
-   // Increment the cycle number (used only to detect taken branches)
-   cyclenum++;
-
-   // Maintain an edge detector for rst
-   last_pin_rst = pin_rst;
 }
 
 // ====================================================================
@@ -1095,6 +781,8 @@ void decode(FILE *stream) {
    int idx_rdy   = arguments.idx_rdy ;
    int idx_phi2  = arguments.idx_phi2;
    int idx_rst   = arguments.idx_rst;
+   int idx_vda   = arguments.idx_vda;
+   int idx_vpa   = arguments.idx_vpa;
 
    // Default Pin values
    int bus_data  =  0;
@@ -1103,6 +791,8 @@ void decode(FILE *stream) {
    int pin_rdy   =  1;
    int pin_phi2  =  0;
    int pin_rst   =  1;
+   int pin_vda   =  0;
+   int pin_vpa   =  0;
 
    int num;
 
@@ -1114,7 +804,12 @@ void decode(FILE *stream) {
    // The previous sample of phi2 (async sampling only)
    int last_phi2 = -1;
 
+   sample_t s;
+
    if (arguments.byte) {
+      s.rnw = -1;
+      s.rst = -1;
+      s.type = UNKNOWN;
 
       // In byte mode we have only data bus samples, nothing else so we must
       // use the sync-less decoder. The values of pin_rnw and pin_rst are set
@@ -1123,7 +818,8 @@ void decode(FILE *stream) {
       while ((num = fread(buffer8, sizeof(uint8_t), BUFSIZE, stream)) > 0) {
          uint8_t *sampleptr = &buffer8[0];
          while (num-- > 0) {
-            lookahead_decode_cycle_without_sync(*sampleptr++, 1, 1);
+            s.data = *sampleptr++;
+            queue_sample(&s);
          }
       }
 
@@ -1144,9 +840,9 @@ void decode(FILE *stream) {
             sample       = *sampleptr++;
 
             // TODO: fix the hard coded values!!!
-            if (arguments.debug >= 2) {
-               printf("%d %02x %x %x %x %x\n", sample_count, sample&255, (sample >> 8)&1,  (sample >> 9)&1,  (sample >> 10)&1,  (sample >> 11)&1  );
-            }
+            //if (arguments.debug & 4) {
+            //   printf("%d %02x %x %x %x %x\n", sample_count, sample&255, (sample >> 8)&1,  (sample >> 9)&1,  (sample >> 10)&1,  (sample >> 11)&1  );
+            //}
             sample_count++;
 
             // Phi2 is optional
@@ -1159,8 +855,17 @@ void decode(FILE *stream) {
                if (idx_rnw >= 0) {
                   pin_rnw = (sample >> idx_rnw ) & 1;
                }
-               if (idx_sync >= 0) {
-                  pin_sync = (sample >> idx_sync) & 1;
+               if (c816) {
+                  if (idx_vda >= 0) {
+                     pin_vda = (sample >> idx_vda) & 1;
+                  }
+                  if (idx_vpa >= 0) {
+                     pin_vpa = (sample >> idx_vpa) & 1;
+                  }
+               } else {
+                  if (idx_sync >= 0) {
+                     pin_sync = (sample >> idx_sync) & 1;
+                  }
                }
                if (idx_rdy >= 0) {
                   pin_rdy = (sample >> idx_rdy) & 1;
@@ -1181,14 +886,25 @@ void decode(FILE *stream) {
 
                if (pin_phi2) {
                   // sample control signals just after rising edge of Phi2
-                  if (idx_rnw >= 0) {
-                     pin_rnw = (sample >> idx_rnw ) & 1;
-                  }
-                  if (idx_sync >= 0) {
-                     pin_sync = (sample >> idx_sync) & 1;
-                  }
-                  if (idx_rst >= 0) {
-                     pin_rst = (sample >> idx_rst) & 1;
+                  if (!c816) {
+                     if (idx_rnw >= 0) {
+                        pin_rnw = (sample >> idx_rnw ) & 1;
+                     }
+                     if (c816) {
+                        if (idx_vda >= 0) {
+                           pin_vda = (sample >> idx_vda) & 1;
+                        }
+                        if (idx_vpa >= 0) {
+                           pin_vpa = (sample >> idx_vpa) & 1;
+                        }
+                     } else {
+                        if (idx_sync >= 0) {
+                           pin_sync = (sample >> idx_sync) & 1;
+                        }
+                     }
+                     if (idx_rst >= 0) {
+                        pin_rst = (sample >> idx_rst) & 1;
+                     }
                   }
                   // continue for more samples
                   continue;
@@ -1196,16 +912,24 @@ void decode(FILE *stream) {
                   if (idx_rdy >= 0) {
                      pin_rdy = (last_sample >> idx_rdy) & 1;
                   }
-                  // TODO: try to rationalize this!
-                  if (arguments.machine == MACHINE_ELK) {
-                     // Data bus sampling for the Elk
-                     if (idx_rnw < 0 || pin_rnw) {
-                        // sample read data just before falling edge of Phi2
-                        bus_data = last_sample & 255;
-                     } else {
-                        // sample write data one cycle earlier
-                        bus_data = last_sample & 255;
+                  if (c816) {
+                     if (idx_rnw >= 0) {
+                        pin_rnw = (last_sample >> idx_rnw ) & 1;
                      }
+                     if (idx_vda >= 0) {
+                        pin_vda = (last_sample >> idx_vda) & 1;
+                     }
+                     if (idx_vpa >= 0) {
+                        pin_vpa = (last_sample >> idx_vpa) & 1;
+                     }
+                     if (idx_rst >= 0) {
+                        pin_rst = (last_sample >> idx_rst) & 1;
+                     }
+                     // sample data just before falling edge of Phi2
+                     bus_data = last_sample & 255;
+                  } else if (arguments.machine == MACHINE_ELK) {
+                     // sample data just before falling edge of Phi2
+                     bus_data = last_sample & 255;
                   } else if (arguments.machine == MACHINE_MASTER) {
                      // Data bus sampling for the Master
                      if (idx_rnw < 0 || pin_rnw) {
@@ -1232,22 +956,39 @@ void decode(FILE *stream) {
             if (pin_rdy == 0)
                continue;
 
-            if (idx_sync < 0) {
-               lookahead_decode_cycle_without_sync(bus_data, pin_rnw, pin_rst);
+            // Build the sample
+            if (c816) {
+               if (idx_vda < 0 || idx_vpa < 0) {
+                  s.type = UNKNOWN;
+               } else {
+                  s.type = pin_vpa ? (pin_vda ? OPCODE : PROGRAM) : (pin_vda ? DATA : INTERNAL);
+               }
             } else {
-               decode_cycle_with_sync(bus_data, pin_rnw, pin_sync, pin_rst);
+               if (idx_sync < 0) {
+                  s.type = UNKNOWN;
+               } else {
+                  s.type = pin_sync ? OPCODE : DATA;
+               }
             }
+            s.data = bus_data;
+            if (idx_rnw < 0) {
+               s.rnw = -1;
+            } else {
+               s.rnw = pin_rnw;
+            }
+            if (idx_rst < 0) {
+               s.rst = -1;
+            } else {
+               s.rst = pin_rst;
+            }
+            queue_sample(&s);
          }
       }
    }
 
-   // Flush the lookhead decoder so it
-   if (idx_sync < 0) {
-      for (int i = 0; i < DEPTH - 1; i++) {
-         lookahead_decode_cycle_without_sync(0xEA, 1, 1);
-      }
-   }
-
+   // Flush the sample queue
+   s.type = LAST;
+   queue_sample(&s);
 }
 
 
@@ -1262,6 +1003,8 @@ int main(int argc, char *argv[]) {
    arguments.idx_rdy          = 10;
    arguments.idx_phi2         = 11;
    arguments.idx_rst          = 14;
+   arguments.idx_vpa          =  9;
+   arguments.idx_vda          = 11;
    arguments.vec_rst          = 0xA9D9CD; // These are the defaults for the beeb
    arguments.machine          = MACHINE_DEFAULT;
 
@@ -1273,10 +1016,13 @@ int main(int argc, char *argv[]) {
    arguments.show_cycles      = 0;
 
    arguments.bbctube          = 0;
-   arguments.emulate          = 0;
-   arguments.c02              = 0;
-   arguments.rockwell         = 0;
+   arguments.cpu_type         = CPU_6502;
    arguments.undocumented     = 0;
+   arguments.e_flag           = -1;
+   arguments.sp_reg           = -1;
+   arguments.pb_reg           = -1;
+   arguments.db_reg           = -1;
+   arguments.dp_reg           = -1;
    arguments.byte             = 0;
    arguments.debug            = 0;
    arguments.profile          = 0;
@@ -1298,10 +1044,8 @@ int main(int argc, char *argv[]) {
       arguments.idx_rdy  = -1;
       arguments.idx_phi2 = -1;
       arguments.idx_rst  = -1;
-   }
-
-   if (arguments.emulate || arguments.bbctube || arguments.show_state || arguments.show_bbcfwa || arguments.idx_sync < 0 || arguments.idx_rnw < 0) {
-      do_emulate = 1;
+      arguments.idx_vpa  = -1;
+      arguments.idx_vda  = -1;
    }
 
    if (arguments.profile) {
@@ -1318,7 +1062,16 @@ int main(int argc, char *argv[]) {
          return 2;
       }
    }
-   em_init(arguments.c02, arguments.rockwell, arguments.undocumented, arguments.bbctube);
+
+   if (arguments.cpu_type == CPU_65C816) {
+      c816 = 1;
+      em = &em_65816;
+   } else {
+      c816 = 0;
+      em = &em_6502;
+   }
+   em->init(&arguments);
+
    decode(stream);
    fclose(stream);
 
