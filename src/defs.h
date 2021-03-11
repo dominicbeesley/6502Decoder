@@ -3,11 +3,15 @@
 
 #include <inttypes.h>
 
-#define MACHINE_DEFAULT 0
-#define MACHINE_MASTER  1
-#define MACHINE_ELK  2
+typedef enum {
+   MACHINE_DEFAULT,
+   MACHINE_BEEB,
+   MACHINE_MASTER,
+   MACHINE_ELK
+} machine_t;
 
 typedef enum {
+   CPU_UNKNOWN,
    CPU_6502,
    CPU_65C02,
    CPU_65C02_ROCKWELL,
@@ -33,6 +37,7 @@ typedef struct {
    uint8_t       data;
    int8_t         rnw; // -1 indicates unknown
    int8_t         rst; // -1 indicates unknown
+   int8_t           e; // -1 indicates unknown (65816 e pin)
 } sample_t;
 
 
@@ -54,6 +59,7 @@ int  write_s   (char *buffer, const char *s);
 
 typedef struct {
    cpu_t cpu_type;
+   machine_t machine;
    int idx_data;
    int idx_rnw;
    int idx_sync;
@@ -62,8 +68,8 @@ typedef struct {
    int idx_rst;
    int idx_vda;
    int idx_vpa;
+   int idx_e;
    int vec_rst;
-   int machine;
    int show_address;
    int show_hex;
    int show_instruction;
@@ -74,17 +80,22 @@ typedef struct {
    int bbctube;
    int undocumented;
    int e_flag;
+   int ms_flag;
+   int xs_flag;
    int sp_reg;
    int pb_reg;
    int db_reg;
    int dp_reg;
    int byte;
    int debug;
+   int skip;
+   int mem_model;
    int profile;
    int trigger_start;
    int trigger_stop;
    int trigger_skipint;
    char *filename;
+   int show_romno;
 } arguments_t;
 
 typedef struct {
@@ -102,7 +113,6 @@ typedef struct {
    int (*get_and_clear_fail)();
 } cpu_emulator_t;
 
-extern arguments_t arguments;
-
+extern int failflag;
 
 #endif

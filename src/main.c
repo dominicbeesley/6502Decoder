@@ -8,7 +8,17 @@
 #include "defs.h"
 #include "em_6502.h"
 #include "em_65816.h"
+#include "memory.h"
 #include "profiler.h"
+
+// Value use to indicate a pin (or register) has not been assigned by
+// the user, so should take the default value.
+#define UNSPECIFIED -2
+
+// Value used to indicate a pin (or register) is undefined. For a pin,
+// this means unconnected. For a register this means it will default
+// to a value of undefined (?).
+#define UNDEFINED -1
 
 int sample_count = 0;
 
@@ -20,6 +30,7 @@ uint16_t buffer[BUFSIZE];
 
 const char *machine_names[] = {
    "default",
+   "beeb",
    "master",
    "elk",
    0
@@ -45,6 +56,12 @@ static int c816;
 // This is a global, so it's visible to the emulator functions
 arguments_t arguments;
 
+// This is a global, so it's visible to the emulator functions
+int triggered = 0;
+
+// indicate state prediction failed
+int failflag = 0;
+
 // ====================================================================
 // Argp processing
 // ====================================================================
@@ -52,21 +69,33 @@ arguments_t arguments;
 const char *argp_program_version = "decode6502 0.1";
 
 const char *argp_program_bug_address = "<dave@hoglet.com>";
-//ndatory or optional arguments to long options are also mandatory or optional
+
 static char doc[] = "\n\
-Decoder for 6502/65C02 logic analyzer capture files.\n\
+Decoder for 6502/65C02/65C816 logic analyzer capture files.\n\
 \n\
-FILENAME must be a binary capture file with 16 bit samples.\n\
+FILENAME must be a binary capture file containing:\n\
+- 16 bit samples (of the data bus and control signals), or\n\
+-  8-bit samples (of the data bus), if the --byte option is present.\n\
 \n\
 If FILENAME is omitted, stdin is read instead.\n\
 \n\
-The default bit assignments for the input signals are:\n\
+The default sample bit assignments for the 6502/65C02 signals are:\n\
  - data: bit  0 (assumes 8 consecutive bits)\n\
  -  rnw: bit  8\n\
  - sync: bit  9\n\
  -  rdy: bit 10\n\
- - phi2: bit 11\n\
  -  rst: bit 14\n\
+ - phi2: bit 15\n\
+\n\
+The default sample bit assignments for the 65C816 signals are:\n\
+ - data: bit  0 (assumes 8 consecutive bits)\n\
+ -  rnw: bit  8\n\
+ -  vpa: bit  9\n\
+ -  rdy: bit 10\n\
+ -  vda: bit 11\n\
+ -    e: bit 12\n\
+ -  rst: bit 14\n\
+ - phi2: bit 15\n\
 \n\
 To specify that an input is unconnected, include the option with an empty\n\
 BITNUM. e.g. --sync=\n\
@@ -76,51 +105,163 @@ falling edge of phi2.\n\
 \n\
 If rdy is not connected a value of '1' is assumed.\n\
 \n\
-If sync is not connected a heuristic based decoder is used. This works well,\n\
-but can take several instructions to lock onto the instruction stream.\n\
-Use of sync, is preferred.\n\
+If sync (or vda/vpa) is not connected a heuristic based decoder is used.\n\
+This works well, but can take several instructions to lock onto the\n\
+instruction stream. Use of sync (or vda/vpa) is recommended.\n\
 \n\
 If RST is not connected, an alternative is to specify the reset vector:\n\
  - D9CD (D9 is the high byte, CD is the low byte)\n\
  - A9D9CD (optionally, also specify the first opcode, LDA # in this case)\n\
 \n\
-";
+If --debug=1 is specified, each instruction is preceeded by it\'s sample values.\n\
+\n\
+The --mem= option controls the memory access logging and modelling. The value\n\
+is three hex nibbles: WRM, where W controls write logging, R controls read\n\
+logging, and M controls modelling.\n\
+Each of the three nibbles has the same semantics:\n\
+ - bit 3 applies to stack accesses\n\
+ - bit 2 applies to data accesses\n\
+ - bit 1 applies to pointer accesses\n\
+ - bit 0 applies to instruction accesses\n\
+Examples:\n\
+ --mem=00F models (and verifies) all accesses, but with minimal extra logging\n\
+ --mem=F0F would additional log all writes\n\
+\n";
 
 static char args_doc[] = "[FILENAME]";
 
+enum {
+   GROUP_GENERAL = 1,
+   GROUP_OUTPUT  = 2,
+   GROUP_SIGDEFS = 3,
+   GROUP_6502    = 4,
+   GROUP_65816   = 5
+};
+
+
+enum {
+   KEY_ADDR = 'a',
+   KEY_BYTE = 'b',
+   KEY_CPU = 'c',
+   KEY_DEBUG = 'd',
+   KEY_BBCFWA = 'f',
+   KEY_HEX = 'h',
+   KEY_INSTR = 'i',
+   KEY_MACHINE = 'm',
+   KEY_PROFILE = 'p',
+   KEY_QUIET = 'q',
+   KEY_STATE = 's',
+   KEY_TRIGGER = 't',
+   KEY_UNDOC = 'u',
+   KEY_CYCLES = 'y',
+   KEY_VECRST = 1,
+   KEY_BBCTUBE,
+   KEY_MEM,
+   KEY_SP,
+   KEY_SKIP,
+   KEY_DATA,
+   KEY_RNW,
+   KEY_RDY,
+   KEY_PHI2,
+   KEY_RST,
+   KEY_SYNC,
+   KEY_VDA,
+   KEY_VPA,
+   KEY_E,
+   KEY_PB,
+   KEY_DB,
+   KEY_DP,
+   KEY_EMUL,
+   KEY_MS,
+   KEY_XS,
+   KEY_SHOWROM = 'r'
+};
+
+
+typedef struct {
+   char *cpu_name;
+   cpu_t cpu_type;
+} cpu_name_t;
+
+static cpu_name_t cpu_names[] = {
+   // 6502
+   {"6502",       CPU_6502},
+   {"R6502",      CPU_6502},
+   {"SY6502",     CPU_6502},
+   {"NMOS",       CPU_6502},
+   {"02",         CPU_6502},
+   // 65C02
+   {"65C02",      CPU_65C02},
+   {"W65C02",     CPU_65C02},
+   {"CMOS",       CPU_65C02},
+   {"C02",        CPU_65C02},
+   // 65C02_ROCKWELL
+   {"R65C02",     CPU_65C02_ROCKWELL},
+   {"ROCKWELL",   CPU_65C02_ROCKWELL},
+   // 65C816
+   {"65816",      CPU_65C816},
+   {"65C816",     CPU_65C816},
+   {"W65816",     CPU_65C816},
+   {"W65C816",    CPU_65C816},
+   {"816",        CPU_65C816},
+   {"C816",       CPU_65C816},
+
+   // Terminator
+   {NULL, 0}
+};
+
 static struct argp_option options[] = {
-   { "data",           1, "BITNUM",                   0, "The start bit number for data"},
-   { "rnw",            2, "BITNUM", OPTION_ARG_OPTIONAL, "The bit number for rnw"},
-   { "sync",           3, "BITNUM", OPTION_ARG_OPTIONAL, "The bit number for sync, blank if unconnected"},
-   { "rdy",            4, "BITNUM", OPTION_ARG_OPTIONAL, "The bit number for rdy, blank if unconnected"},
-   { "phi2",           5, "BITNUM", OPTION_ARG_OPTIONAL, "The bit number for phi2, blank if unconnected"},
-   { "rst",            6, "BITNUM", OPTION_ARG_OPTIONAL, "The bit number for rst, blank if unconnected"},
-   { "vecrst",         7,    "HEX", OPTION_ARG_OPTIONAL, "The reset vector, black if not known"},
-   { "machine",      'm', "MACHINE",                  0, "Enable machine specific behaviour"},
-   { "c02",          'c',        0,                   0, "Enable 65C02 mode."},
-   { "c816",         '8',        0,                   0, "Enable 65C816 mode."},
-   { "rockwell",     'r',        0,                   0, "Enable additional rockwell instructions."},
-   { "undocumented", 'u',        0,                   0, "Enable undocumented 6502 opcodes (currently incomplete)"},
-   { "byte",         'b',        0,                   0, "Byte samples"},
-   { "debug",        'd',  "LEVEL",                   0, "Sets debug level (bitmask)"},
-// Output options
-   { "quiet",        'q',        0,                   0, "Set all the show options to off."},
-   { "address",      'a',        0,                   0, "Show address of instruction."},
-   { "hex",          'h',        0,                   0, "Show hex bytes of instruction."},
-   { "instruction",  'i',        0,                   0, "Show instruction."},
-   { "state",        's',        0,                   0, "Show register/flag state."},
-   { "cycles",       'y',        0,                   0, "Show number of bus cycles."},
-   { "profile",      'p', "PARAMS", OPTION_ARG_OPTIONAL, "Profile code execution."},
-   { "trigger",      't',"ADDRESS",                   0, "Trigger on address."},
-   { "bbcfwa",       'f',        0,                   0, "Show BBC floating poing work areas."},
-   { "bbctube",       8,         0,                   0, "Decode BBC tube protocol"},
-   { "vda",           9,  "BITNUM", OPTION_ARG_OPTIONAL, "The bit number for vda, blank if unconnected"},
-   { "vpa",          10,  "BITNUM", OPTION_ARG_OPTIONAL, "The bit number for vpa, blank if unconnected"},
-   { "emul",         11,     "HEX", OPTION_ARG_OPTIONAL, "Initial value E flag in 65816 mode"},
-   { "sp",           12,     "HEX", OPTION_ARG_OPTIONAL, "Initial value Stack Pointer register (65816)"},
-   { "pb",           13,     "HEX", OPTION_ARG_OPTIONAL, "Initial value Program Bank register (65816)"},
-   { "db",           14,     "HEX", OPTION_ARG_OPTIONAL, "Initial value Data Bank register (65816)"},
-   { "dp",           15,     "HEX", OPTION_ARG_OPTIONAL, "Initial value Direct Page register (65816)"},
+   { 0, 0, 0, 0, "General options:", GROUP_GENERAL},
+
+   { "vecrst",      KEY_VECRST,    "HEX",  OPTION_ARG_OPTIONAL, "Reset vector, optionally preceeded by the first opcode (e.g. A9D9CD)",
+                                                                                                                     GROUP_GENERAL},
+   { "cpu",            KEY_CPU,     "CPU",                   0, "Sets CPU type (6502, 65c02, r65c02, 65c816)",       GROUP_GENERAL},
+   { "machine",    KEY_MACHINE, "MACHINE",                   0, "Enable machine (beeb,elk,master) defaults",         GROUP_GENERAL},
+   { "byte",          KEY_BYTE,         0,                   0, "Enable byte-wide sample mode",                      GROUP_GENERAL},
+   { "debug",        KEY_DEBUG,   "LEVEL",                   0, "Sets the debug level (0 or 1)",                     GROUP_GENERAL},
+   { "profile",    KEY_PROFILE,  "PARAMS", OPTION_ARG_OPTIONAL, "Profile code execution",                            GROUP_GENERAL},
+   { "trigger",    KEY_TRIGGER, "ADDRESS",                   0, "Trigger on address",                                GROUP_GENERAL},
+   { "bbctube",    KEY_BBCTUBE,         0,                   0, "BBC tube protocol decoding",                        GROUP_GENERAL},
+   { "mem",            KEY_MEM,     "HEX", OPTION_ARG_OPTIONAL, "Memory modelling (see above)",                      GROUP_GENERAL},
+   { "skip",          KEY_SKIP,     "HEX", OPTION_ARG_OPTIONAL, "Skip the first n samples",                          GROUP_GENERAL},
+
+   { 0, 0, 0, 0, "Output options:", GROUP_OUTPUT},
+
+   { "quiet",        KEY_QUIET,         0,                   0, "Set all the output options to off",                 GROUP_OUTPUT},
+   { "address",       KEY_ADDR,         0,                   0, "Show address of instruction",                       GROUP_OUTPUT},
+   { "hex",            KEY_HEX,         0,                   0, "Show hex bytes of instruction",                     GROUP_OUTPUT},
+   { "instruction",  KEY_INSTR,         0,                   0, "Show instruction disassembly",                      GROUP_OUTPUT},
+   { "state",        KEY_STATE,         0,                   0, "Show register/flag state",                          GROUP_OUTPUT},
+   { "cycles",      KEY_CYCLES,         0,                   0, "Show number of bus cycles",                         GROUP_OUTPUT},
+   { "bbcfwa",      KEY_BBCFWA,         0,                   0, "Show BBC floating-point work areas",                GROUP_OUTPUT},
+   { "showromno",   KEY_SHOWROM,         0,                   0, "Show BBC rom no for address 8000..BFFF",            GROUP_OUTPUT},
+
+   { 0, 0, 0, 0, "Signal defintion options:", GROUP_SIGDEFS},
+
+   { "data",          KEY_DATA, "BITNUM",                   0, "Bit number for data (default  0)",                   GROUP_SIGDEFS},
+   { "rnw",            KEY_RNW, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for rnw  (default  8)",                   GROUP_SIGDEFS},
+   { "rdy",            KEY_RDY, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for rdy  (default 10)",                   GROUP_SIGDEFS},
+   { "phi2",          KEY_PHI2, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for phi2 (default 11)",                   GROUP_SIGDEFS}, // TODO change to 15
+   { "rst",            KEY_RST, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for rst  (default 14)",                   GROUP_SIGDEFS},
+   { "sync",          KEY_SYNC, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for sync (default  9) (6502/65C02)",      GROUP_SIGDEFS},
+   { "vpa",            KEY_VPA, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for vpa  (default  9) (65C816)",          GROUP_SIGDEFS},
+   { "vda",            KEY_VDA, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for vda  (default 11) (65C816)",          GROUP_SIGDEFS},
+   { "e",                KEY_E, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for e    (default 12) (65C816)",          GROUP_SIGDEFS},
+
+   { 0, 0, 0, 0, "Additional 6502/65C02 options:", GROUP_6502},
+
+   { "undocumented", KEY_UNDOC,        0,                   0, "Enable undocumented opcodes",                        GROUP_6502},
+   { "sp",              KEY_SP,     "HEX", OPTION_ARG_OPTIONAL, "Initial value of the Stack Pointer register",       GROUP_6502},
+
+   { 0, 0, 0, 0, "Additional 65C816 options:", GROUP_65816},
+
+   { "pb",              KEY_PB,    "HEX", OPTION_ARG_OPTIONAL, "Initial value of the Program Bank register",         GROUP_65816},
+   { "db",              KEY_DB,    "HEX", OPTION_ARG_OPTIONAL, "Initial value of the Data Bank register",            GROUP_65816},
+   { "dp",              KEY_DP,    "HEX", OPTION_ARG_OPTIONAL, "Initial value of the Direct Page register",          GROUP_65816},
+   { "emul",          KEY_EMUL,    "HEX", OPTION_ARG_OPTIONAL, "Initial value of the E flag",                        GROUP_65816},
+   { "ms",              KEY_MS,    "HEX", OPTION_ARG_OPTIONAL, "Initial value of the M flag",                        GROUP_65816},
+   { "xs",              KEY_XS,    "HEX", OPTION_ARG_OPTIONAL, "Initial value of the X flag",                        GROUP_65816},
+   { "sp",              KEY_SP,     "HEX", OPTION_ARG_OPTIONAL, "Initial value of the Stack Pointer register",       GROUP_65816},
    { 0 }
 };
 
@@ -132,112 +273,152 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
    profiler_parse_opt(key, arg, state);
 
    switch (key) {
-   case   1:
+   case KEY_DATA:
       arguments->idx_data = atoi(arg);
-   case   2:
+      break;
+   case KEY_RNW:
       if (arg && strlen(arg) > 0) {
          arguments->idx_rnw = atoi(arg);
       } else {
-         arguments->idx_rnw = -1;
+         arguments->idx_rnw = UNDEFINED;
       }
       break;
-   case   3:
+   case KEY_SYNC:
       if (arg && strlen(arg) > 0) {
          arguments->idx_sync = atoi(arg);
       } else {
-         arguments->idx_sync = -1;
+         arguments->idx_sync = UNDEFINED;
       }
       break;
-   case   4:
+   case KEY_RDY:
       if (arg && strlen(arg) > 0) {
          arguments->idx_rdy = atoi(arg);
       } else {
-         arguments->idx_rdy = -1;
+         arguments->idx_rdy = UNDEFINED;
       }
       break;
-   case   5:
+   case KEY_PHI2:
       if (arg && strlen(arg) > 0) {
          arguments->idx_phi2 = atoi(arg);
       } else {
-         arguments->idx_phi2 = -1;
+         arguments->idx_phi2 = UNDEFINED;
       }
       break;
-   case   6:
+   case KEY_RST:
       if (arg && strlen(arg) > 0) {
          arguments->idx_rst = atoi(arg);
       } else {
-         arguments->idx_rst = -1;
+         arguments->idx_rst = UNDEFINED;
       }
       break;
-   case   7:
+   case KEY_VECRST:
       if (arg && strlen(arg) > 0) {
          arguments->vec_rst = strtol(arg, (char **)NULL, 16);
       } else {
-         arguments->vec_rst = -1;
+         arguments->vec_rst = UNDEFINED;
       }
       break;
-   case   8:
+   case KEY_BBCTUBE:
       arguments->bbctube = 1;
       break;
-   case   9:
+   case KEY_VDA:
       if (arg && strlen(arg) > 0) {
          arguments->idx_vda = atoi(arg);
       } else {
-         arguments->idx_vda = -1;
+         arguments->idx_vda = UNDEFINED;
       }
       break;
-   case  10:
+   case KEY_VPA:
       if (arg && strlen(arg) > 0) {
          arguments->idx_vpa = atoi(arg);
       } else {
-         arguments->idx_vpa = -1;
+         arguments->idx_vpa = UNDEFINED;
       }
       break;
-   case  11:
+   case KEY_E:
+      if (arg && strlen(arg) > 0) {
+         arguments->idx_e = atoi(arg);
+      } else {
+         arguments->idx_e = UNDEFINED;
+      }
+      break;
+   case KEY_EMUL:
       if (arg && strlen(arg) > 0) {
          arguments->e_flag = strtol(arg, (char **)NULL, 16);
       } else {
-         arguments->e_flag = -1;
+         arguments->e_flag = UNDEFINED;
       }
       break;
-   case  12:
+   case KEY_SP:
       if (arg && strlen(arg) > 0) {
          arguments->sp_reg = strtol(arg, (char **)NULL, 16);
       } else {
-         arguments->sp_reg = -1;
+         arguments->sp_reg = UNDEFINED;
       }
       break;
-   case  13:
+   case KEY_PB:
       if (arg && strlen(arg) > 0) {
          arguments->pb_reg = strtol(arg, (char **)NULL, 16);
       } else {
-         arguments->pb_reg = -1;
+         arguments->pb_reg = UNDEFINED;
       }
       break;
-   case  14:
+   case KEY_DB:
       if (arg && strlen(arg) > 0) {
          arguments->db_reg = strtol(arg, (char **)NULL, 16);
       } else {
-         arguments->db_reg = -1;
+         arguments->db_reg = UNDEFINED;
       }
       break;
-   case  15:
+   case KEY_DP:
       if (arg && strlen(arg) > 0) {
          arguments->dp_reg = strtol(arg, (char **)NULL, 16);
       } else {
-         arguments->dp_reg = -1;
+         arguments->dp_reg = UNDEFINED;
       }
       break;
-   case 'c':
-      arguments->cpu_type = CPU_65C02;
+   case KEY_MS:
+      if (arg && strlen(arg) > 0) {
+         arguments->ms_flag = strtol(arg, (char **)NULL, 16);
+      } else {
+         arguments->ms_flag = UNDEFINED;
+      }
       break;
-   case '8':
-      arguments->cpu_type = CPU_65C816;
+   case KEY_XS:
+      if (arg && strlen(arg) > 0) {
+         arguments->xs_flag = strtol(arg, (char **)NULL, 16);
+      } else {
+         arguments->xs_flag = UNDEFINED;
+      }
       break;
-   case 'r':
-      arguments->cpu_type = CPU_65C02_ROCKWELL;
+   case KEY_SKIP:
+      if (arg && strlen(arg) > 0) {
+         arguments->skip = strtol(arg, (char **)NULL, 16);
+      } else {
+         arguments->skip = 0;
+      }
       break;
-   case 'm':
+   case KEY_MEM:
+      if (arg && strlen(arg) > 0) {
+         arguments->mem_model = strtol(arg, (char **)NULL, 16);
+      } else {
+         arguments->mem_model = 0;
+      }
+      break;
+   case KEY_CPU:
+      if (arg && strlen(arg) > 0) {
+         i = 0;
+         while (cpu_names[i].cpu_name) {
+            if (strcasecmp(arg, cpu_names[i].cpu_name) == 0) {
+               arguments->cpu_type = cpu_names[i].cpu_type;
+               return 0;
+            }
+            i++;
+         }
+      }
+      argp_error(state, "unsupported cpu type: %s", arg);
+      break;
+   case KEY_MACHINE:
       i = 0;
       while (machine_names[i]) {
          if (strcasecmp(arg, machine_names[i]) == 0) {
@@ -248,13 +429,13 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
       }
       argp_error(state, "unsupported machine type");
       break;
-   case 'd':
+   case KEY_DEBUG:
       arguments->debug = atoi(arg);
       break;
-   case 'b':
+   case KEY_BYTE:
       arguments->byte = 1;
       break;
-   case 'q':
+   case KEY_QUIET:
       arguments->show_address = 0;
       arguments->show_hex = 0;
       arguments->show_instruction = 0;
@@ -262,28 +443,31 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
       arguments->show_bbcfwa = 0;
       arguments->show_cycles = 0;
       break;
-   case 'a':
+   case KEY_ADDR:
       arguments->show_address = 1;
       break;
-   case 'h':
+   case KEY_SHOWROM:
+      arguments->show_romno = 1;
+      break;
+   case KEY_HEX:
       arguments->show_hex = 1;
       break;
-   case 'i':
+   case KEY_INSTR:
       arguments->show_instruction = 1;
       break;
-   case 's':
+   case KEY_STATE:
       arguments->show_state = 1;
       break;
-   case 'f':
+   case KEY_BBCFWA:
       arguments->show_bbcfwa = 1;
       break;
-   case 'y':
+   case KEY_CYCLES:
       arguments->show_cycles = 1;
       break;
-   case 'p':
+   case KEY_PROFILE:
       arguments->profile = 1;
       break;
-   case 't':
+   case KEY_TRIGGER:
       if (arg && strlen(arg) > 0) {
          char *start   = strtok(arg, ",");
          char *stop    = strtok(NULL, ",");
@@ -299,7 +483,7 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
          }
       }
       break;
-   case 'u':
+   case KEY_UNDOC:
       arguments->undocumented = 1;
       break;
    case ARGP_KEY_ARG:
@@ -326,9 +510,10 @@ static struct argp argp = { options, parse_opt, args_doc, doc, 0, 0, 0 };
 
 
 static void dump_samples(sample_t *sample_q, int n) {
+      static int ctr = 0;
       for (int i = 0; i < n; i++) {
          sample_t *sample = sample_q + i;
-         printf("%d %02x ", i, sample->data);
+         printf("%8d %8x %d %02x ", ctr, ctr, i, sample->data);
          switch(sample->type) {
          case INTERNAL:
             putchar('I');
@@ -354,6 +539,7 @@ static void dump_samples(sample_t *sample_q, int n) {
          putchar(' ');
          putchar(sample->rst >= 0 ? '0' + sample->rst : '?');
          putchar('\n');
+         ctr++;
       }
 
 }
@@ -460,10 +646,9 @@ static char *get_fwa(int a_sign, int a_exp, int a_mantissa, int a_round, int a_o
 
 
 static int analyze_instruction(sample_t *sample_q, int num_samples, int rst_seen) {
-
+   static int total_cycles = 0;
    static int interrupt_depth = 0;
    static int skipping_interrupted = 0;
-   static int triggered = 0;
 
    int intr_seen = em->match_interrupt(sample_q, num_samples);
 
@@ -480,7 +665,7 @@ static int analyze_instruction(sample_t *sample_q, int num_samples, int rst_seen
       return num_samples;
    }
 
-   if (arguments.debug & 1) {
+   if (triggered && arguments.debug & 1) {
       dump_samples(sample_q, num_cycles);
    }
 
@@ -521,10 +706,12 @@ static int analyze_instruction(sample_t *sample_q, int num_samples, int rst_seen
       }
    }
 
-   if (arguments.trigger_start < 0 || (pc >= 0 && pc == arguments.trigger_start)) {
+   if (pc >= 0 && pc == arguments.trigger_start) {
       triggered = 1;
+      printf("start trigger hit at cycle %d\n", total_cycles);
    } else if (pc >= 0 && pc == arguments.trigger_stop) {
       triggered = 0;
+      printf("stop trigger hit at cycle %d\n", total_cycles);
    }
 
    // Exclude interrupts from profiling
@@ -562,6 +749,20 @@ static int analyze_instruction(sample_t *sample_q, int num_samples, int rst_seen
             } else {
                write_hex2(bp, pb);
                bp += 2;
+            }
+         }
+         if (arguments.show_romno) {
+            if (pc >= 0x8000 && pc <= 0xBFFF) {
+               int romno = em->read_memory(0xF4);
+               if (romno < 0)
+                  *bp++ = '?';
+               else {
+                  write_hex1(bp++, romno & 0x0F);
+               }
+               *bp++ = ':';
+            } else {
+               *bp++ = ' ';
+               *bp++ = ' ';
             }
          }
          if (pc < 0) {
@@ -647,7 +848,7 @@ static int analyze_instruction(sample_t *sample_q, int num_samples, int rst_seen
 
    }
 
-
+   total_cycles += num_cycles;
    return num_cycles;
 }
 
@@ -783,6 +984,7 @@ void decode(FILE *stream) {
    int idx_rst   = arguments.idx_rst;
    int idx_vda   = arguments.idx_vda;
    int idx_vpa   = arguments.idx_vpa;
+   int idx_e     = arguments.idx_e;
 
    // Default Pin values
    int bus_data  =  0;
@@ -793,6 +995,7 @@ void decode(FILE *stream) {
    int pin_rst   =  1;
    int pin_vda   =  0;
    int pin_vpa   =  0;
+   int pin_e     =  0;
 
    int num;
 
@@ -805,6 +1008,11 @@ void decode(FILE *stream) {
    int last_phi2 = -1;
 
    sample_t s;
+
+   // Skip the start of the file, if required
+   if (arguments.skip) {
+      fseek(stream, arguments.skip * (arguments.byte ? 1 : 2), SEEK_SET);
+   }
 
    if (arguments.byte) {
       s.rnw = -1;
@@ -862,6 +1070,9 @@ void decode(FILE *stream) {
                   if (idx_vpa >= 0) {
                      pin_vpa = (sample >> idx_vpa) & 1;
                   }
+                  if (idx_e >= 0) {
+                     pin_e = (sample >> idx_e) & 1;
+                  }
                } else {
                   if (idx_sync >= 0) {
                      pin_sync = (sample >> idx_sync) & 1;
@@ -897,6 +1108,9 @@ void decode(FILE *stream) {
                         if (idx_vpa >= 0) {
                            pin_vpa = (sample >> idx_vpa) & 1;
                         }
+                        if (idx_e >= 0) {
+                           pin_e = (sample >> idx_e) & 1;
+                        }
                      } else {
                         if (idx_sync >= 0) {
                            pin_sync = (sample >> idx_sync) & 1;
@@ -921,6 +1135,9 @@ void decode(FILE *stream) {
                      }
                      if (idx_vpa >= 0) {
                         pin_vpa = (last_sample >> idx_vpa) & 1;
+                     }
+                     if (idx_e >= 0) {
+                        pin_e = (last_sample >> idx_e) & 1;
                      }
                      if (idx_rst >= 0) {
                         pin_rst = (last_sample >> idx_rst) & 1;
@@ -981,6 +1198,11 @@ void decode(FILE *stream) {
             } else {
                s.rst = pin_rst;
             }
+            if (idx_e < 0) {
+               s.e = -1;
+            } else {
+               s.e = pin_e;
+            }
             queue_sample(&s);
          }
       }
@@ -997,17 +1219,23 @@ void decode(FILE *stream) {
 // ====================================================================
 
 int main(int argc, char *argv[]) {
-   arguments.idx_data         =  0;
-   arguments.idx_rnw          =  8;
-   arguments.idx_sync         =  9;
-   arguments.idx_rdy          = 10;
-   arguments.idx_phi2         = 11;
-   arguments.idx_rst          = 14;
-   arguments.idx_vpa          =  9;
-   arguments.idx_vda          = 11;
-   arguments.vec_rst          = 0xA9D9CD; // These are the defaults for the beeb
+   // General options
+   arguments.cpu_type         = CPU_UNKNOWN;
    arguments.machine          = MACHINE_DEFAULT;
+   arguments.vec_rst          = UNSPECIFIED;
+   arguments.sp_reg           = UNSPECIFIED;
+   arguments.bbctube          = 0;
+   arguments.byte             = 0;
+   arguments.debug            = 0;
+   arguments.mem_model        = 0;
+   arguments.skip             = 0;
+   arguments.profile          = 0;
+   arguments.trigger_start    = UNSPECIFIED;
+   arguments.trigger_stop     = UNSPECIFIED;
+   arguments.trigger_skipint  = 0;
+   arguments.filename         = NULL;
 
+   // Output options
    arguments.show_address     = 1;
    arguments.show_hex         = 0;
    arguments.show_instruction = 1;
@@ -1015,23 +1243,33 @@ int main(int argc, char *argv[]) {
    arguments.show_bbcfwa      = 0;
    arguments.show_cycles      = 0;
 
-   arguments.bbctube          = 0;
-   arguments.cpu_type         = CPU_6502;
+   // Signal definition options
+   arguments.idx_data         = UNSPECIFIED;
+   arguments.idx_rnw          = UNSPECIFIED;
+   arguments.idx_sync         = UNSPECIFIED;
+   arguments.idx_vpa          = UNSPECIFIED;
+   arguments.idx_rdy          = UNSPECIFIED;
+   arguments.idx_vda          = UNSPECIFIED;
+   arguments.idx_e            = UNSPECIFIED;
+   arguments.idx_rst          = UNSPECIFIED;
+   arguments.idx_phi2         = UNSPECIFIED;
+
+   // Additional 6502 options
    arguments.undocumented     = 0;
-   arguments.e_flag           = -1;
-   arguments.sp_reg           = -1;
-   arguments.pb_reg           = -1;
-   arguments.db_reg           = -1;
-   arguments.dp_reg           = -1;
-   arguments.byte             = 0;
-   arguments.debug            = 0;
-   arguments.profile          = 0;
-   arguments.trigger_start    = -1;
-   arguments.trigger_stop     = -1;
-   arguments.trigger_skipint  = 0;
-   arguments.filename         = NULL;
+
+   // Additional 65816 options
+   arguments.pb_reg           = UNSPECIFIED;
+   arguments.db_reg           = UNSPECIFIED;
+   arguments.dp_reg           = UNSPECIFIED;
+   arguments.e_flag           = UNSPECIFIED;
+   arguments.ms_flag          = UNSPECIFIED;
+   arguments.xs_flag          = UNSPECIFIED;
 
    argp_parse(&argp, argc, argv, 0, 0, &arguments);
+
+   if (arguments.trigger_start < 0) {
+      triggered = 1;
+   }
 
    arguments.show_something = arguments.show_address | arguments.show_hex | arguments.show_instruction | arguments.show_state | arguments.show_bbcfwa | arguments.show_cycles;
 
@@ -1039,14 +1277,168 @@ int main(int argc, char *argv[]) {
    // the data file is 8 bit samples, and all the control signals are
    // assumed to be don't care.
    if (arguments.byte) {
-      arguments.idx_rnw  = -1;
-      arguments.idx_sync = -1;
-      arguments.idx_rdy  = -1;
-      arguments.idx_phi2 = -1;
-      arguments.idx_rst  = -1;
-      arguments.idx_vpa  = -1;
-      arguments.idx_vda  = -1;
+      if (arguments.idx_rnw != UNSPECIFIED) {
+         fprintf(stderr, "--rnw is incompatible with byte mode\n");
+         return 1;
+      }
+      if (arguments.idx_sync != UNSPECIFIED) {
+         fprintf(stderr, "--sync is incompatible with byte mode\n");
+         return 1;
+      }
+      if (arguments.idx_phi2 != UNSPECIFIED) {
+         fprintf(stderr, "--phi2 is incompatible with byte mode\n");
+         return 1;
+      }
+      if (arguments.idx_rst != UNSPECIFIED) {
+         fprintf(stderr, "--rst is incompatible with byte mode\n");
+         return 1;
+      }
+      if (arguments.idx_rdy != UNSPECIFIED) {
+         fprintf(stderr, "--rdy is incompatible with byte mode\n");
+         return 1;
+      }
+      if (arguments.idx_vpa != UNSPECIFIED) {
+         fprintf(stderr, "--vpa is incompatible with byte mode\n");
+         return 1;
+      }
+      if (arguments.idx_vda != UNSPECIFIED) {
+         fprintf(stderr, "--vda is incompatible with byte mode\n");
+         return 1;
+      }
+      if (arguments.idx_e != UNSPECIFIED) {
+         fprintf(stderr, "--e is incompatible with byte mode\n");
+         return 1;
+      }
    }
+
+   // Apply Machine specific defaults
+   if (arguments.vec_rst == UNSPECIFIED) {
+      switch (arguments.machine) {
+      case MACHINE_BEEB:
+         arguments.vec_rst = 0xA9D9CD;
+         break;
+      case MACHINE_MASTER:
+         arguments.vec_rst = 0xA9E364;
+         break;
+      case MACHINE_ELK:
+         arguments.vec_rst = 0xA9D8D2;
+         break;
+      default:
+         arguments.vec_rst = 0xFFFFFF;
+      }
+   }
+   if (arguments.cpu_type == CPU_UNKNOWN) {
+      switch (arguments.machine) {
+      case MACHINE_MASTER:
+         arguments.cpu_type = CPU_65C02;
+         break;
+      default:
+         arguments.cpu_type = CPU_6502;
+         break;
+      }
+   }
+
+   // Initialize memory modelling
+   // (em->init actually mallocs the memory)
+   if (arguments.cpu_type == CPU_65C816) {
+      // 16MB
+      memory_init(0x1000000, arguments.machine, arguments.bbctube);
+   } else {
+      // 64KB
+      memory_init(0x10000, arguments.machine, arguments.bbctube);
+   }
+
+   memory_set_modelling(  arguments.mem_model       & 0x0f);
+   memory_set_rd_logging((arguments.mem_model >> 4) & 0x0f);
+   memory_set_wr_logging((arguments.mem_model >> 8) & 0x0f);
+
+   // Validate options compatibility with CPU
+   if (arguments.cpu_type != CPU_6502 && arguments.undocumented) {
+      fprintf(stderr, "--undocumented is only applicable to the 6502\n");
+      return 1;
+   }
+   if (arguments.cpu_type == CPU_65C816) {
+      if (arguments.idx_sync != UNSPECIFIED) {
+         fprintf(stderr, "--sync is not applicable to the 65C816\n");
+         return 1;
+      }
+   } else {
+      if (arguments.idx_vda != UNSPECIFIED) {
+         fprintf(stderr, "--vda is only applicable to the 65C816\n");
+         return 1;
+      }
+      if (arguments.idx_vpa != UNSPECIFIED) {
+         fprintf(stderr, "--vpa is only applicable to the 65C816\n");
+         return 1;
+      }
+      if (arguments.idx_e != UNSPECIFIED) {
+         fprintf(stderr, "--e is only applicable to the 65C816\n");
+         return 1;
+      }
+      if (arguments.pb_reg != UNSPECIFIED) {
+         fprintf(stderr, "--pb is only applicable to the 65C816\n");
+         return 1;
+      }
+      if (arguments.db_reg != UNSPECIFIED) {
+         fprintf(stderr, "--db is only applicable to the 65C816\n");
+         return 1;
+      }
+      if (arguments.dp_reg != UNSPECIFIED) {
+         fprintf(stderr, "--dp is only applicable to the 65C816\n");
+         return 1;
+      }
+      if (arguments.e_flag != UNSPECIFIED) {
+         fprintf(stderr, "--emul is only applicable to the 65C816\n");
+         return 1;
+      }
+      if (arguments.ms_flag != UNSPECIFIED) {
+         fprintf(stderr, "--ms is only applicable to the 65C816\n");
+         return 1;
+      }
+      if (arguments.xs_flag != UNSPECIFIED) {
+         fprintf(stderr, "--xs is only applicable to the 65C816\n");
+         return 1;
+      }
+   }
+
+   // Implement default pins mapping for unspecified pins
+   if (arguments.idx_data == UNSPECIFIED) {
+      arguments.idx_data = 0;
+   }
+   if (arguments.idx_rnw == UNSPECIFIED) {
+      arguments.idx_rnw = 8;
+   }
+   if (arguments.idx_sync == UNSPECIFIED) {
+      arguments.idx_sync = 9;
+   }
+   if (arguments.idx_vpa == UNSPECIFIED) {
+      arguments.idx_vpa = 9;
+   }
+   if (arguments.idx_rdy == UNSPECIFIED) {
+      arguments.idx_rdy = 10;
+   }
+   if (arguments.idx_vda == UNSPECIFIED) {
+      arguments.idx_vda = 11;
+   }
+   if (arguments.idx_e == UNSPECIFIED) {
+      arguments.idx_e = 12;
+   }
+   if (arguments.idx_rst == UNSPECIFIED) {
+      arguments.idx_rst = 14;
+   }
+   if (arguments.idx_phi2 == UNSPECIFIED) {
+      arguments.idx_phi2 = 15;
+   }
+
+   if (arguments.cpu_type == CPU_65C816) {
+      c816 = 1;
+      em = &em_65816;
+   } else {
+      c816 = 0;
+      em = &em_6502;
+   }
+
+   em->init(&arguments);
 
    if (arguments.profile) {
       profiler_init();
@@ -1063,14 +1455,7 @@ int main(int argc, char *argv[]) {
       }
    }
 
-   if (arguments.cpu_type == CPU_65C816) {
-      c816 = 1;
-      em = &em_65816;
-   } else {
-      c816 = 0;
-      em = &em_6502;
-   }
-   em->init(&arguments);
+   
 
    decode(stream);
    fclose(stream);
