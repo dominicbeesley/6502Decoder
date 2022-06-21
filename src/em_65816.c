@@ -545,7 +545,7 @@ static int get_8bit_cycles(sample_t *sample_q) {
    // <opcode> <op1> [ <dpextra> ] <addrlo> <addrhi> [ <page crossing>] <operand> [ <extra cycle in dec mode> ]
    if ((instr->mode == INDY) && (instr->optype != WRITEOP) && Y >= 0) {
       int base = (sample_q[3 + dpextra].data << 8) + sample_q[2 + dpextra].data;
-      if ((base & 0xff00) != ((base + Y) & 0xff00)) {
+      if ((base & 0x1ff00) != ((base + Y) & 0x1ff00)) {
          cycle_count++;
       }
    }
@@ -555,7 +555,7 @@ static int get_8bit_cycles(sample_t *sample_q) {
       int index = (instr->mode == ABSX) ? X : Y;
       if (index >= 0) {
          int base = op1 + (op2 << 8);
-         if ((base & 0xff00) != ((base + index) & 0xff00)) {
+         if ((base & 0x1ff00) != ((base + index) & 0x1ff00)) {
             cycle_count++;
          }
       }
@@ -571,7 +571,8 @@ static int get_num_cycles(sample_t *sample_q, int intr_seen) {
    InstrType *instr = &instr_table[opcode];
    int cycle_count = instr->cycles;
 
-   if (intr_seen) {
+   // Interrupt, BRK, COP
+   if (intr_seen || opcode == 0x00 || opcode == 0x02) {
       return (E == 0) ? 8 : 7;
    }
 
@@ -619,7 +620,8 @@ static int get_num_cycles(sample_t *sample_q, int intr_seen) {
    // <opcode> <op1> [ <dpextra> ] <addrlo> <addrhi> [ <page crossing>] <operand> [ <extra cycle in dec mode> ]
    if ((instr->mode == INDY) && (instr->optype != WRITEOP) && Y >= 0) {
       int base = (sample_q[3 + dpextra].data << 8) + sample_q[2 + dpextra].data;
-      if ((base & 0xff00) != ((base + Y) & 0xff00)) {
+      // TODO: take account of page crossing with 16-bit Y
+      if ((base & 0x1ff00) != ((base + Y) & 0x1ff00)) {
          cycle_count++;
       }
    }
@@ -630,7 +632,7 @@ static int get_num_cycles(sample_t *sample_q, int intr_seen) {
       int index = (instr->mode == ABSX) ? X : Y;
       if (index >= 0) {
          int base = op1 + (op2 << 8);
-         if ((base & 0xff00) != ((base + index) & 0xff00)) {
+         if ((base & 0x1ff00) != ((base + index) & 0x1ff00)) {
             correction = 1;
          } else {
             correction = 0;
@@ -876,6 +878,10 @@ static void em_65816_init(arguments_t *args) {
          for (int j = 0; m1_ops[j]; j++) {
             if (!strcmp(instr->mnemonic, m1_ops[j])) {
                instr->m_extra++;
+               if (instr->optype == READOP && (instr->mode == ABSX || instr->mode == ABSY)) {
+                  // add 1 further cycle if x=0: ABS,X or ABS,Y
+                  instr->x_extra++;
+               }
                break;
             }
          }
@@ -890,12 +896,12 @@ static void em_65816_init(arguments_t *args) {
          for (int j = 0; x1_ops[j]; j++) {
             if (!strcmp(instr->mnemonic, x1_ops[j])) {
                instr->x_extra++;
+               if (instr->mode == ABSX || instr->mode == ABSY) {
+                  // add 1 further cycle if x=0: LDX ABS,Y or LDY ABS,X
+                  instr->x_extra++;
+               }
                break;
             }
-         }
-         // if ABSX ot ABXY add
-         if (instr->mode == ABSX || instr->mode == ABSY) {
-            instr->x_extra++;
          }
       }
       // Copy the length and format from the address mode, for efficiency
@@ -923,8 +929,8 @@ static int em_65816_match_interrupt(sample_t *sample_q, int num_samples) {
    // TODO: the heuristic only works in emulation mode
    if (sample_q[0].rnw >= 0) {
       // If we have the RNW pin connected, then just look for these three writes in succession
-      // Currently can't detect a BRK being interrupted
-      if (sample_q[0].data == 0x00) {
+      // Currently can't detect a BRK or COP being interrupted
+      if (sample_q[0].data == 0x00 || sample_q[0].data == 0x02) {
          return 0;
       }
       if (sample_q[2].rnw == 0 && sample_q[3].rnw == 0 && sample_q[4].rnw == 0) {
@@ -1038,7 +1044,7 @@ static void em_65816_emulate(sample_t *sample_q, int num_cycles, instruction_t *
    // Memory Modelling: Instruction fetches
    if (PB >= 0 && PC >= 0) {
       int pc = (PB << 16) + PC;
-      memory_read(opcode, pc++, MEM_INSTR);
+      memory_read(opcode, pc++, MEM_FETCH);
       if (opcount >= 1) {
          memory_read(op1, pc++, MEM_INSTR);
       }
@@ -1279,7 +1285,7 @@ static void em_65816_emulate(sample_t *sample_q, int num_cycles, instruction_t *
    switch (instr->mode) {
    case ZP:
       if (DP >= 0) {
-         ea = (DP + op1);
+         ea = (DP + op1) & 0xffff; // always bank 0
       }
       break;
    case ZPX:
@@ -1289,7 +1295,7 @@ static void em_65816_emulate(sample_t *sample_q, int num_cycles, instruction_t *
          if (wrap) {
             ea = (DP & 0xff00) + ((op1 + index) & 0xff);
          } else {
-            ea = DP + op1 + index;
+            ea = (DP + op1 + index) & 0xffff; // always bank 0
          }
       }
       break;
@@ -1298,7 +1304,7 @@ static void em_65816_emulate(sample_t *sample_q, int num_cycles, instruction_t *
       index = Y;
       if (index >= 0 && DB >= 0) {
          ea = (sample_q[3 + dpextra].data << 8) + sample_q[2 + dpextra].data;
-         ea = (DB << 16) + ((ea + index) & 0xffff);
+         ea = ((DB << 16) + ea + index) & 0xffffff;
       }
       break;
    case INDX:
@@ -1310,7 +1316,7 @@ static void em_65816_emulate(sample_t *sample_q, int num_cycles, instruction_t *
    case IND:
       // <opcode> <op1>  [ <dpextra> ] <addrlo> <addrhi> <operand>
       if (DB >= 0) {
-         ea = (DB << 16) + (sample_q[3].data << 8) + sample_q[2].data;
+         ea = (DB << 16) + (sample_q[3 + dpextra].data << 8) + sample_q[2 + dpextra].data;
       }
       break;
    case ABS:
@@ -1322,7 +1328,7 @@ static void em_65816_emulate(sample_t *sample_q, int num_cycles, instruction_t *
    case ABSY:
       index = instr->mode == ABSX ? X : Y;
       if (index >= 0 && DB >= 0) {
-         ea = (DB << 16) + (((op2 << 8 | op1) + index) & 0xffff);
+         ea = ((DB << 16) + (op2 << 8) + op1 + index) & 0xffffff;
       }
       break;
    case BRA:
@@ -1348,7 +1354,7 @@ static void em_65816_emulate(sample_t *sample_q, int num_cycles, instruction_t *
    case IDL:
       // e.g. LDA [80]
       // <opcode> <op1> [ <dpextra> ] <addrlo> <addrhi> <bank> <operand>
-      ea = (sample_q[4].data << 16) + (sample_q[3].data << 8) + sample_q[2].data;
+      ea = (sample_q[4 + dpextra].data << 16) + (sample_q[3 + dpextra].data << 8) + sample_q[2 + dpextra].data;
       break;
    case IDLY:
       // e.g. LDA [80],Y
@@ -1391,6 +1397,9 @@ static void em_65816_emulate(sample_t *sample_q, int num_cycles, instruction_t *
 
    if (instr->emulate) {
 
+      // Is direct page access, as this wraps within bank 0
+      int isDP = instr->mode == ZP || instr->mode == ZPX || instr->mode == ZPY;
+
       // Determine memory access size
       int size = instr->x_extra ? XS : instr->m_extra ? MS : 1;
 
@@ -1399,8 +1408,12 @@ static void em_65816_emulate(sample_t *sample_q, int num_cycles, instruction_t *
          int oplo = (operand & 0xff);
          int ophi = ((operand >> 8) & 0xff);
          if (size == 0) {
-            memory_read(oplo,  ea              , MEM_DATA);
-            memory_read(ophi, (ea + 1) & 0xffff, MEM_DATA);
+            memory_read(oplo,  ea    , MEM_DATA);
+            if (isDP) {
+               memory_read(ophi,  (ea + 1) & 0xffff, MEM_DATA);
+            } else {
+               memory_read(ophi,  ea + 1, MEM_DATA);
+            }
          } else if (size > 0) {
             memory_read(oplo, ea, MEM_DATA);
          }
@@ -1425,7 +1438,11 @@ static void em_65816_emulate(sample_t *sample_q, int num_cycles, instruction_t *
          if (ea >= 0) {
             memory_write(operand2 & 0xff,  ea, MEM_DATA);
             if (size == 0) {
-               memory_write((operand2 >> 8) & 0xff, (ea + 1) & 0xffff, MEM_DATA);
+               if (isDP) {
+                  memory_write((operand2 >> 8) & 0xff, (ea + 1) & 0xffff, MEM_DATA);
+               } else {
+                  memory_write((operand2 >> 8) & 0xff, ea + 1, MEM_DATA);
+               }
             }
          }
       }
@@ -1753,6 +1770,8 @@ static int op_MV(int data, int sba, int dba, int dir) {
       Y = -1;
       PC = -1;
    }
+   // Set the Data Bank to the destination bank
+   DB = dba;
    return -1;
 }
 

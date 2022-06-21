@@ -234,14 +234,14 @@ static struct argp_option options[] = {
    { "state",        KEY_STATE,         0,                   0, "Show register/flag state",                          GROUP_OUTPUT},
    { "cycles",      KEY_CYCLES,         0,                   0, "Show number of bus cycles",                         GROUP_OUTPUT},
    { "bbcfwa",      KEY_BBCFWA,         0,                   0, "Show BBC floating-point work areas",                GROUP_OUTPUT},
-   { "showromno",   KEY_SHOWROM,         0,                   0, "Show BBC rom no for address 8000..BFFF",            GROUP_OUTPUT},
+   { "showromno",   KEY_SHOWROM,        0,                   0, "Show BBC rom no for address 8000..BFFF",            GROUP_OUTPUT},
 
    { 0, 0, 0, 0, "Signal defintion options:", GROUP_SIGDEFS},
 
    { "data",          KEY_DATA, "BITNUM",                   0, "Bit number for data (default  0)",                   GROUP_SIGDEFS},
    { "rnw",            KEY_RNW, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for rnw  (default  8)",                   GROUP_SIGDEFS},
    { "rdy",            KEY_RDY, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for rdy  (default 10)",                   GROUP_SIGDEFS},
-   { "phi2",          KEY_PHI2, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for phi2 (default 11)",                   GROUP_SIGDEFS}, // TODO change to 15
+   { "phi2",          KEY_PHI2, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for phi2 (default 15)",                   GROUP_SIGDEFS},
    { "rst",            KEY_RST, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for rst  (default 14)",                   GROUP_SIGDEFS},
    { "sync",          KEY_SYNC, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for sync (default  9) (6502/65C02)",      GROUP_SIGDEFS},
    { "vpa",            KEY_VPA, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for vpa  (default  9) (65C816)",          GROUP_SIGDEFS},
@@ -251,7 +251,7 @@ static struct argp_option options[] = {
    { 0, 0, 0, 0, "Additional 6502/65C02 options:", GROUP_6502},
 
    { "undocumented", KEY_UNDOC,        0,                   0, "Enable undocumented opcodes",                        GROUP_6502},
-   { "sp",              KEY_SP,     "HEX", OPTION_ARG_OPTIONAL, "Initial value of the Stack Pointer register",       GROUP_6502},
+   { "sp",              KEY_SP,    "HEX", OPTION_ARG_OPTIONAL, "Initial value of the Stack Pointer register",       GROUP_6502},
 
    { 0, 0, 0, 0, "Additional 65C816 options:", GROUP_65816},
 
@@ -261,7 +261,7 @@ static struct argp_option options[] = {
    { "emul",          KEY_EMUL,    "HEX", OPTION_ARG_OPTIONAL, "Initial value of the E flag",                        GROUP_65816},
    { "ms",              KEY_MS,    "HEX", OPTION_ARG_OPTIONAL, "Initial value of the M flag",                        GROUP_65816},
    { "xs",              KEY_XS,    "HEX", OPTION_ARG_OPTIONAL, "Initial value of the X flag",                        GROUP_65816},
-   { "sp",              KEY_SP,     "HEX", OPTION_ARG_OPTIONAL, "Initial value of the Stack Pointer register",       GROUP_65816},
+   { "sp",              KEY_SP,    "HEX", OPTION_ARG_OPTIONAL, "Initial value of the Stack Pointer register",       GROUP_65816},
    { 0 }
 };
 
@@ -752,18 +752,7 @@ static int analyze_instruction(sample_t *sample_q, int num_samples, int rst_seen
             }
          }
          if (arguments.show_romno) {
-            if (pc >= 0x8000 && pc <= 0xBFFF) {
-               int romno = em->read_memory(0xF4);
-               if (romno < 0)
-                  *bp++ = '?';
-               else {
-                  write_hex1(bp++, romno & 0x0F);
-               }
-               *bp++ = ':';
-            } else {
-               *bp++ = ' ';
-               *bp++ = ' ';
-            }
+            bp += write_bankid(bp, pc);
          }
          if (pc < 0) {
             *bp++ = '?';
@@ -883,7 +872,7 @@ int decode_instruction(sample_t *sample_q, int num_samples) {
    // Flag to indicate the sample type is missing (sync/vda/vpa unconnected)
    int notype = sample_q[0].type == UNKNOWN;
 
-   if (arguments.idx_rst < 0) {
+   if (sample_q[0].rst < 0) {
       // We use a heuristic, based on what we expect to see on the data
       // bus in cycles 5, 6 and 7, i.e. RSTVECL, RSTVECH, RSTOPCODE
       int veclo  = (arguments.vec_rst      ) & 0xff;
@@ -1101,20 +1090,8 @@ void decode(FILE *stream) {
                      if (idx_rnw >= 0) {
                         pin_rnw = (sample >> idx_rnw ) & 1;
                      }
-                     if (c816) {
-                        if (idx_vda >= 0) {
-                           pin_vda = (sample >> idx_vda) & 1;
-                        }
-                        if (idx_vpa >= 0) {
-                           pin_vpa = (sample >> idx_vpa) & 1;
-                        }
-                        if (idx_e >= 0) {
-                           pin_e = (sample >> idx_e) & 1;
-                        }
-                     } else {
-                        if (idx_sync >= 0) {
-                           pin_sync = (sample >> idx_sync) & 1;
-                        }
+                     if (idx_sync >= 0) {
+                        pin_sync = (sample >> idx_sync) & 1;
                      }
                      if (idx_rst >= 0) {
                         pin_rst = (sample >> idx_rst) & 1;
@@ -1348,6 +1325,11 @@ int main(int argc, char *argv[]) {
       memory_init(0x10000, arguments.machine, arguments.bbctube);
    }
 
+   // Turn on memory write logging if show rom bank option (-r) is selected
+   if (arguments.show_romno) {
+      arguments.mem_model |= (1 << MEM_DATA) | (1 << MEM_STACK);
+   }
+
    memory_set_modelling(  arguments.mem_model       & 0x0f);
    memory_set_rd_logging((arguments.mem_model >> 4) & 0x0f);
    memory_set_wr_logging((arguments.mem_model >> 8) & 0x0f);
@@ -1455,7 +1437,7 @@ int main(int argc, char *argv[]) {
       }
    }
 
-   
+
 
    decode(stream);
    fclose(stream);
