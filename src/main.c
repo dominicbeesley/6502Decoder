@@ -8,8 +8,35 @@
 #include "defs.h"
 #include "em_6502.h"
 #include "em_65816.h"
+#include "em_6800.h"
+#include "em_scmp.h"
 #include "memory.h"
 #include "profiler.h"
+#include "symbols.h"
+
+typedef void (*queue_sample_t)(sample_t *sample);
+
+// BLOCK controls the amount of look-ahead that is allow
+//
+// It's made very large (8M samples), so that long running instructions
+// like SYNC, CWAI and even RESET will fit entirely within one block.
+//
+// This makes the decoder much simpler
+//
+// There is no reason BLOCK couldn't be increased further, if needed
+
+#define DEFAULT_BLOCK (8*1024*1024)
+
+// Sample buffer base and rd/wr pointers
+static sample_t *sample_q;
+static sample_t *sample_wr;
+static sample_t *sample_rd;
+
+// Small skew buffer to allow the data bus samples to be taken early or late
+
+#define SKEW_BUFFER_SIZE  32 // Must be a power of 2
+
+#define MAX_SKEW_VALUE ((SKEW_BUFFER_SIZE / 2) - 1)
 
 // Value use to indicate a pin (or register) has not been assigned by
 // the user, so should take the default value.
@@ -20,19 +47,26 @@
 // to a value of undefined (?).
 #define UNDEFINED -1
 
-int sample_count = 0;
-
 #define BUFSIZE 8192
 
 uint8_t buffer8[BUFSIZE];
 
 uint16_t buffer[BUFSIZE];
 
+#define DOCSIZE 10000
+
+char machines_doc[DOCSIZE];
+
+char cpus_doc[DOCSIZE];
+
 const char *machine_names[] = {
    "default",
    "beeb",
    "master",
    "elk",
+   "atom",
+   "mek6800d2",
+   "blitter",
    0
 };
 
@@ -52,6 +86,7 @@ static char disbuf[256];
 static cpu_emulator_t *em;
 
 static int c816;
+static int arlet;
 
 // This is a global, so it's visible to the emulator functions
 arguments_t arguments;
@@ -135,7 +170,8 @@ enum {
    GROUP_OUTPUT  = 2,
    GROUP_SIGDEFS = 3,
    GROUP_6502    = 4,
-   GROUP_65816   = 5
+   GROUP_65816   = 5,
+   GROUP_SCMP    = 6
 };
 
 
@@ -150,19 +186,28 @@ enum {
    KEY_MACHINE = 'm',
    KEY_PROFILE = 'p',
    KEY_QUIET = 'q',
+   KEY_SHOWROM = 'r',
    KEY_STATE = 's',
    KEY_TRIGGER = 't',
    KEY_UNDOC = 'u',
    KEY_CYCLES = 'y',
-   KEY_VECRST = 1,
+   KEY_SAMPLES = 'Y',
+   KEY_VECRST = 1000,
    KEY_BBCTUBE,
    KEY_MEM,
    KEY_SP,
    KEY_SKIP,
+   KEY_BLOCK,
+   KEY_SKEW,
+   KEY_SKEW_RD,
+   KEY_SKEW_WR,
+   KEY_LABELS,
    KEY_DATA,
    KEY_RNW,
    KEY_RDY,
+   KEY_PHI1,
    KEY_PHI2,
+   KEY_USER,
    KEY_RST,
    KEY_SYNC,
    KEY_VDA,
@@ -174,7 +219,13 @@ enum {
    KEY_EMUL,
    KEY_MS,
    KEY_XS,
-   KEY_SHOWROM = 'r'
+   KEY_CLKDIV,
+   KEY_PSR,
+   KEY_ADS,
+   KEY_HOLD,
+   KEY_SA,
+   KEY_SB,
+   KEY_SIN
 };
 
 
@@ -192,12 +243,21 @@ static cpu_name_t cpu_names[] = {
    {"02",         CPU_6502},
    // 65C02
    {"65C02",      CPU_65C02},
-   {"W65C02",     CPU_65C02},
    {"CMOS",       CPU_65C02},
    {"C02",        CPU_65C02},
    // 65C02_ROCKWELL
    {"R65C02",     CPU_65C02_ROCKWELL},
    {"ROCKWELL",   CPU_65C02_ROCKWELL},
+   // 65C02_WDC
+   {"WD65C02",    CPU_65C02_WDC},
+   {"W65C02",     CPU_65C02_WDC},
+   {"WDC",        CPU_65C02_WDC},
+   // 6502_ARLET
+   {"ARLET",      CPU_6502_ARLET},
+   // 65C02_ARLET
+   {"ARLETC02",   CPU_65C02_ARLET},
+   // 65C02_ALAND
+   {"ALANDC02",   CPU_65C02_ALAND},
    // 65C816
    {"65816",      CPU_65C816},
    {"65C816",     CPU_65C816},
@@ -205,9 +265,33 @@ static cpu_name_t cpu_names[] = {
    {"W65C816",    CPU_65C816},
    {"816",        CPU_65C816},
    {"C816",       CPU_65C816},
-
+   // 6800
+   {"6800",       CPU_6800},
+   {"M6800",      CPU_6800},
+   {"MC6800",     CPU_6800},
+   {"6802",       CPU_6800},
+   {"M6802",      CPU_6800},
+   {"MC6802",     CPU_6800},
+   // SC/MO
+   {"SC/MP",      CPU_SCMP},
+   {"SCMP",       CPU_SCMP},
+   {"INS8060",    CPU_SCMP},
    // Terminator
    {NULL, 0}
+};
+
+static int cpu_rst_delay[] = {
+   9, // CPU_UNKNOWN
+   9, // CPU_6502
+   9, // CPU_6502_ARLET
+   8, // CPU_65C02
+   8, // CPU_65C02_ROCKWELL
+   8, // CPU_65C02_WDC
+   9, // CPU_65C02_ARLET
+   9, // CPU_65C02_ALAND
+   9, // CPU_65C816
+   3, // CPU_6800
+  29  // CPU_SCMP
 };
 
 static struct argp_option options[] = {
@@ -215,8 +299,8 @@ static struct argp_option options[] = {
 
    { "vecrst",      KEY_VECRST,    "HEX",  OPTION_ARG_OPTIONAL, "Reset vector, optionally preceeded by the first opcode (e.g. A9D9CD)",
                                                                                                                      GROUP_GENERAL},
-   { "cpu",            KEY_CPU,     "CPU",                   0, "Sets CPU type (6502, 65c02, r65c02, 65c816)",       GROUP_GENERAL},
-   { "machine",    KEY_MACHINE, "MACHINE",                   0, "Enable machine (beeb,elk,master) defaults",         GROUP_GENERAL},
+   { "cpu",            KEY_CPU,     "CPU",                   0, "Sets CPU type (see above)",                         GROUP_GENERAL},
+   { "machine",    KEY_MACHINE, "MACHINE",                   0, "Sets machine specific defaults and memory model (see above)", GROUP_GENERAL},
    { "byte",          KEY_BYTE,         0,                   0, "Enable byte-wide sample mode",                      GROUP_GENERAL},
    { "debug",        KEY_DEBUG,   "LEVEL",                   0, "Sets the debug level (0 or 1)",                     GROUP_GENERAL},
    { "profile",    KEY_PROFILE,  "PARAMS", OPTION_ARG_OPTIONAL, "Profile code execution",                            GROUP_GENERAL},
@@ -224,6 +308,11 @@ static struct argp_option options[] = {
    { "bbctube",    KEY_BBCTUBE,         0,                   0, "BBC tube protocol decoding",                        GROUP_GENERAL},
    { "mem",            KEY_MEM,     "HEX", OPTION_ARG_OPTIONAL, "Memory modelling (see above)",                      GROUP_GENERAL},
    { "skip",          KEY_SKIP,     "HEX", OPTION_ARG_OPTIONAL, "Skip the first n samples",                          GROUP_GENERAL},
+   { "block",        KEY_BLOCK,     "HEX", OPTION_ARG_OPTIONAL, "Set the buffer block size (default=800000)",        GROUP_GENERAL},
+   { "skew",          KEY_SKEW,    "SKEW", OPTION_ARG_OPTIONAL, "Skew the data bus by +/- n samples",                GROUP_GENERAL},
+   { "skew_rd",    KEY_SKEW_RD,    "SKEW", OPTION_ARG_OPTIONAL, "Skew the data bus by +/- n samples for read data",  GROUP_GENERAL},
+   { "skew_wr",    KEY_SKEW_WR,    "SKEW", OPTION_ARG_OPTIONAL, "Skew the data bus by +/- n samples for write data", GROUP_GENERAL},
+   { "labels",      KEY_LABELS,   "FILE",                    0, "Swift format label/symbols file e.g. from beebasm", GROUP_GENERAL},
 
    { 0, 0, 0, 0, "Output options:", GROUP_OUTPUT},
 
@@ -233,6 +322,7 @@ static struct argp_option options[] = {
    { "instruction",  KEY_INSTR,         0,                   0, "Show instruction disassembly",                      GROUP_OUTPUT},
    { "state",        KEY_STATE,         0,                   0, "Show register/flag state",                          GROUP_OUTPUT},
    { "cycles",      KEY_CYCLES,         0,                   0, "Show number of bus cycles",                         GROUP_OUTPUT},
+   { "samplenum",  KEY_SAMPLES,         0,                   0, "Show bus cycle numbers",                            GROUP_OUTPUT},
    { "bbcfwa",      KEY_BBCFWA,         0,                   0, "Show BBC floating-point work areas",                GROUP_OUTPUT},
    { "showromno",   KEY_SHOWROM,        0,                   0, "Show BBC rom no for address 8000..BFFF",            GROUP_OUTPUT},
 
@@ -241,17 +331,16 @@ static struct argp_option options[] = {
    { "data",          KEY_DATA, "BITNUM",                   0, "Bit number for data (default  0)",                   GROUP_SIGDEFS},
    { "rnw",            KEY_RNW, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for rnw  (default  8)",                   GROUP_SIGDEFS},
    { "rdy",            KEY_RDY, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for rdy  (default 10)",                   GROUP_SIGDEFS},
+   { "phi1",          KEY_PHI1, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for phi1 (default -1)",                   GROUP_SIGDEFS},
    { "phi2",          KEY_PHI2, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for phi2 (default 15)",                   GROUP_SIGDEFS},
+   { "user",          KEY_USER, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for user (default -1)",                   GROUP_SIGDEFS},
    { "rst",            KEY_RST, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for rst  (default 14)",                   GROUP_SIGDEFS},
-   { "sync",          KEY_SYNC, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for sync (default  9) (6502/65C02)",      GROUP_SIGDEFS},
-   { "vpa",            KEY_VPA, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for vpa  (default  9) (65C816)",          GROUP_SIGDEFS},
-   { "vda",            KEY_VDA, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for vda  (default 11) (65C816)",          GROUP_SIGDEFS},
-   { "e",                KEY_E, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for e    (default 12) (65C816)",          GROUP_SIGDEFS},
 
    { 0, 0, 0, 0, "Additional 6502/65C02 options:", GROUP_6502},
 
    { "undocumented", KEY_UNDOC,        0,                   0, "Enable undocumented opcodes",                        GROUP_6502},
-   { "sp",              KEY_SP,    "HEX", OPTION_ARG_OPTIONAL, "Initial value of the Stack Pointer register",       GROUP_6502},
+   { "sp",              KEY_SP,    "HEX", OPTION_ARG_OPTIONAL, "Initial value of the Stack Pointer register",        GROUP_6502},
+   { "sync",          KEY_SYNC, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for sync (default  9)",                   GROUP_6502},
 
    { 0, 0, 0, 0, "Additional 65C816 options:", GROUP_65816},
 
@@ -261,9 +350,34 @@ static struct argp_option options[] = {
    { "emul",          KEY_EMUL,    "HEX", OPTION_ARG_OPTIONAL, "Initial value of the E flag",                        GROUP_65816},
    { "ms",              KEY_MS,    "HEX", OPTION_ARG_OPTIONAL, "Initial value of the M flag",                        GROUP_65816},
    { "xs",              KEY_XS,    "HEX", OPTION_ARG_OPTIONAL, "Initial value of the X flag",                        GROUP_65816},
-   { "sp",              KEY_SP,    "HEX", OPTION_ARG_OPTIONAL, "Initial value of the Stack Pointer register",       GROUP_65816},
+   { "sp",              KEY_SP,    "HEX", OPTION_ARG_OPTIONAL, "Initial value of the Stack Pointer register",        GROUP_65816},
+   { "vpa",            KEY_VPA, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for vpa (default  9)",                    GROUP_65816},
+   { "vda",            KEY_VDA, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for vda (default 11)",                    GROUP_65816},
+   { "e",                KEY_E, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for e (default 12)",                      GROUP_65816},
+
+   { 0, 0, 0, 0, "Additional SC/MP options:", GROUP_SCMP},
+
+   { "clkdiv",      KEY_CLKDIV,    "HEX", OPTION_ARG_OPTIONAL, "Sample clk to microcycle clk ratio (default 4)",     GROUP_SCMP},
+   { "psr",            KEY_PSR,    "HEX", OPTION_ARG_OPTIONAL, "Initial value of the processor status register",     GROUP_SCMP},
+   { "ads",            KEY_ADS, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for sa (default 9)",                      GROUP_SCMP},
+   { "hold",          KEY_HOLD, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for sa (default 10)",                     GROUP_SCMP},
+   { "sa",              KEY_SA, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for sa (default 11)",                     GROUP_SCMP},
+   { "sb",              KEY_SB, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for sa (default 12)",                     GROUP_SCMP},
+   { "sin",            KEY_SIN, "BITNUM", OPTION_ARG_OPTIONAL, "Bit number for sin (default 13)",                    GROUP_SCMP},
+
    { 0 }
 };
+
+static int parse_skew(char *arg, struct argp_state *state) {
+   int skew = 0;
+   if (arg && strlen(arg) > 0) {
+      skew = strtol(arg, (char **)NULL, 10);
+      if (skew < -MAX_SKEW_VALUE || skew > MAX_SKEW_VALUE) {
+         argp_error(state, "specified skew exceeds skew buffer size");
+      }
+   }
+   return skew;
+}
 
 static error_t parse_opt(int key, char *arg, struct argp_state *state) {
    int i;
@@ -297,11 +411,25 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
          arguments->idx_rdy = UNDEFINED;
       }
       break;
+   case KEY_PHI1:
+      if (arg && strlen(arg) > 0) {
+         arguments->idx_phi1 = atoi(arg);
+      } else {
+         arguments->idx_phi1 = UNDEFINED;
+      }
+      break;
    case KEY_PHI2:
       if (arg && strlen(arg) > 0) {
          arguments->idx_phi2 = atoi(arg);
       } else {
          arguments->idx_phi2 = UNDEFINED;
+      }
+      break;
+   case KEY_USER:
+      if (arg && strlen(arg) > 0) {
+         arguments->idx_user = atoi(arg);
+      } else {
+         arguments->idx_user = UNDEFINED;
       }
       break;
    case KEY_RST:
@@ -398,6 +526,26 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
          arguments->skip = 0;
       }
       break;
+   case KEY_BLOCK:
+      if (arg && strlen(arg) > 0) {
+         arguments->block = strtol(arg, (char **)NULL, 16);
+      } else {
+         arguments->block = DEFAULT_BLOCK;
+      }
+      break;
+   case KEY_SKEW:
+      arguments->skew_rd = parse_skew(arg, state);
+      arguments->skew_wr = arguments->skew_rd;
+      break;
+   case KEY_SKEW_RD:
+      arguments->skew_rd = parse_skew(arg, state);
+      break;
+   case KEY_SKEW_WR:
+      arguments->skew_wr = parse_skew(arg, state);
+      break;
+   case KEY_LABELS:
+      arguments->labels_file = arg;
+      break;
    case KEY_MEM:
       if (arg && strlen(arg) > 0) {
          arguments->mem_model = strtol(arg, (char **)NULL, 16);
@@ -416,7 +564,7 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             i++;
          }
       }
-      argp_error(state, "unsupported cpu type: %s", arg);
+      argp_error(state, "unsupported cpu type: %s\n\n%s", arg, cpus_doc);
       break;
    case KEY_MACHINE:
       i = 0;
@@ -427,7 +575,7 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
          }
          i++;
       }
-      argp_error(state, "unsupported machine type");
+      argp_error(state, "unsupported machine type: %s\n\n%s", arg, machines_doc);
       break;
    case KEY_DEBUG:
       arguments->debug = atoi(arg);
@@ -442,6 +590,7 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
       arguments->show_state = 0;
       arguments->show_bbcfwa = 0;
       arguments->show_cycles = 0;
+      arguments->show_samplenums = 0;
       break;
    case KEY_ADDR:
       arguments->show_address = 1;
@@ -463,6 +612,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
       break;
    case KEY_CYCLES:
       arguments->show_cycles = 1;
+      break;
+   case KEY_SAMPLES:
+      arguments->show_samplenums = 1;
       break;
    case KEY_PROFILE:
       arguments->profile = 1;
@@ -486,6 +638,55 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
    case KEY_UNDOC:
       arguments->undocumented = 1;
       break;
+   case KEY_CLKDIV: // SC/MP only
+      if (arg && strlen(arg) > 0) {
+         arguments->clkdiv = strtol(arg, (char **)NULL, 16);;
+      } else {
+         arguments->clkdiv = UNDEFINED;
+      }
+      break;
+   case KEY_PSR: // SC/MP only
+      if (arg && strlen(arg) > 0) {
+         arguments->psr_reg = strtol(arg, (char **)NULL, 16);;
+      } else {
+         arguments->psr_reg = UNDEFINED;
+      }
+      break;
+   case KEY_ADS: // SC/MP only
+      if (arg && strlen(arg) > 0) {
+         arguments->idx_ads = atoi(arg);
+      } else {
+         arguments->idx_ads = UNDEFINED;
+      }
+      break;
+   case KEY_HOLD: // SC/MP only
+      if (arg && strlen(arg) > 0) {
+         arguments->idx_hold = atoi(arg);
+      } else {
+         arguments->idx_hold = UNDEFINED;
+      }
+      break;
+   case KEY_SA:// SC/MP only
+      if (arg && strlen(arg) > 0) {
+         arguments->idx_sa = atoi(arg);
+      } else {
+         arguments->idx_sa = UNDEFINED;
+      }
+      break;
+   case KEY_SB: // SC/MP only
+      if (arg && strlen(arg) > 0) {
+         arguments->idx_sb = atoi(arg);
+      } else {
+         arguments->idx_sb = UNDEFINED;
+      }
+      break;
+   case KEY_SIN: // SC/MP only
+      if (arg && strlen(arg) > 0) {
+         arguments->idx_sin = atoi(arg);
+      } else {
+         arguments->idx_sin = UNDEFINED;
+      }
+      break;
    case ARGP_KEY_ARG:
       arguments->filename = arg;
       break;
@@ -500,9 +701,6 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
    return 0;
 }
 
-static struct argp argp = { options, parse_opt, args_doc, doc, 0, 0, 0 };
-
-
 
 // ====================================================================
 // Analyze a complete instruction
@@ -510,10 +708,9 @@ static struct argp argp = { options, parse_opt, args_doc, doc, 0, 0, 0 };
 
 
 static void dump_samples(sample_t *sample_q, int n) {
-      static int ctr = 0;
       for (int i = 0; i < n; i++) {
          sample_t *sample = sample_q + i;
-         printf("%8d %8x %d %02x ", ctr, ctr, i, sample->data);
+         printf("%08x %2d %02x ", sample->sample_count, i, sample->data);
          switch(sample->type) {
          case INTERNAL:
             putchar('I');
@@ -538,10 +735,12 @@ static void dump_samples(sample_t *sample_q, int n) {
          putchar(sample->rnw >= 0 ? '0' + sample->rnw : '?');
          putchar(' ');
          putchar(sample->rst >= 0 ? '0' + sample->rst : '?');
+         if (sample->user >= 0) {
+            putchar(' ');
+            putchar('0' + sample->user);
+         }
          putchar('\n');
-         ctr++;
       }
-
 }
 
 void write_hex1(char *buffer, int value) {
@@ -561,6 +760,17 @@ void write_hex4(char *buffer, int value) {
 }
 
 void write_hex6(char *buffer, int value) {
+   write_hex1(buffer++, (value >> 20) & 15);
+   write_hex1(buffer++, (value >> 16) & 15);
+   write_hex1(buffer++, (value >> 12) & 15);
+   write_hex1(buffer++, (value >> 8) & 15);
+   write_hex1(buffer++, (value >> 4) & 15);
+   write_hex1(buffer++, (value >> 0) & 15);
+}
+
+void write_hex8(char *buffer, int value) {
+   write_hex1(buffer++, (value >> 28) & 15);
+   write_hex1(buffer++, (value >> 24) & 15);
    write_hex1(buffer++, (value >> 20) & 15);
    write_hex1(buffer++, (value >> 16) & 15);
    write_hex1(buffer++, (value >> 12) & 15);
@@ -653,11 +863,53 @@ static int analyze_instruction(sample_t *sample_q, int num_samples, int rst_seen
    int intr_seen = em->match_interrupt(sample_q, num_samples);
 
    int num_cycles;
+   int real_cycles;
+
+   // This is a rather ugly hack to cope with a decode failure on Arlet's core.
+   //
+   if (arlet) {
+      int op = sample_q->data;
+      if (op == 0x08 || op == 0x48 || ((op == 0x5A || op == 0xDA) && (arguments.cpu_type == CPU_65C02_ARLET))) {
+         // PHP, PHA, PHX, PHY
+         //
+         //    Normal 6502   Arlet
+         // 0: 48 R SYNC     48 R SYNC <<<<< Push instruction
+         // 1: XX R          XX R
+         // 2: AA W          YY R
+         // 3: XX R SYNC     AA W SYNC <<<<< Next instruction
+         // 4: YY R          YY R
+         //
+         // Reorder the samples to make it look conventional:
+         //   3->2
+         //   1->3
+         // But preserve the original type (sync) value, as this is correct
+         sample_q[2].data = sample_q[3].data;
+         sample_q[2].rnw  = sample_q[3].rnw;
+         sample_q[3].data = sample_q[1].data;
+         sample_q[3].rnw  = sample_q[1].rnw;
+      }
+      if (op == 0x28 || op == 0x68 || ((op == 0x7A || op == 0xFA) && (arguments.cpu_type == CPU_65C02_ARLET))) {
+         // PLP, PLA, PLX, PLY
+         //
+         //    Normal 6502   Arlet
+         // 0: 68 R SYNC     68 R SYNC <<<<< Pull instruction
+         // 1: XX R          XX R
+         // 2: ?? R          YY R
+         // 3: AA R          AA R
+         // 4: XX R SYNC     YY R SYNC <<<<< Next instruction
+         // 5: YY R          YY R
+         //
+         // Reorder the samples to make it look conventional
+         //    1->4
+         // But preserve the original type (sync) value, as this is correct
+         sample_q[4].data = sample_q[1].data;
+      }
+   }
 
    if (rst_seen > 0) {
       num_cycles = rst_seen;
    } else {
-      num_cycles = em->count_cycles(sample_q, intr_seen);
+      num_cycles = em->count_cycles(sample_q, num_samples, intr_seen);
    }
 
    // Deal with partial final instruction
@@ -684,6 +936,8 @@ static int analyze_instruction(sample_t *sample_q, int num_samples, int rst_seen
       // Handle a normal instruction
       em->emulate(sample_q, num_cycles, &instruction);
    }
+
+   real_cycles = sample_q[num_cycles].cycle_count - sample_q[0].cycle_count;
 
    // Sanity check the pc prediction has not gone awry
    // (e.g. in JSR the emulation can use the stacked PC)
@@ -729,7 +983,7 @@ static int analyze_instruction(sample_t *sample_q, int num_samples, int rst_seen
 
    if (arguments.profile && triggered && !skipping_interrupted && !intr_seen) {
       // TODO: refactor profiler to take instruction_t *
-      profiler_profile_instruction(instruction.pc, instruction.opcode, instruction.op1, instruction.op2, num_cycles);
+      profiler_profile_instruction(instruction.pc, instruction.opcode, instruction.op1, instruction.op2, real_cycles);
    }
 
    int fail = em->get_and_clear_fail();
@@ -740,6 +994,14 @@ static int analyze_instruction(sample_t *sample_q, int num_samples, int rst_seen
 
    if ((fail | arguments.show_something) && triggered && !skipping_interrupted) {
       int numchars = 0;
+      // Show sample count
+      if (arguments.show_samplenums) {
+         write_hex8(bp, sample_q->sample_count);
+         bp += 8;
+         *bp++ = ' ';
+         *bp++ = ':';
+         *bp++ = ' ';
+      }
       // Show address
       if (fail || arguments.show_address) {
          if (c816) {
@@ -812,8 +1074,8 @@ static int analyze_instruction(sample_t *sample_q, int num_samples, int rst_seen
          *bp++ = ' ';
          *bp++ = ':';
          *bp++ = ' ';
-         // No instruction is more then 8 cycles
-         write_hex1(bp++, num_cycles);
+         // No 6502 instruction is more then 8 cycles, but scmp delay is
+         bp += sprintf(bp, "%3d", real_cycles / arguments.clkdiv);
       }
       // Show register state
       if (fail || arguments.show_state) {
@@ -827,6 +1089,18 @@ static int analyze_instruction(sample_t *sample_q, int num_samples, int rst_seen
          bp += sprintf(bp, " : FWA %s", get_fwa(0x2e, 0x30, 0x31, 0x35, 0x2f));
          bp += sprintf(bp, " : FWB %s", get_fwa(0x3b, 0x3c, 0x3d, 0x41,   -1));
       }
+      // Show the user defined signal value
+      if (arguments.idx_user >= 0) {
+         *bp++ = ' ';
+         *bp++ = ':';
+         *bp++ = ' ';
+         int user = sample_q[num_cycles - 1].user;
+         if (user >= 0) {
+            *bp++ = '0' + user;
+         } else {
+            *bp++ = '?';
+         }
+      }
       // Show any errors
       if (fail) {
          bp += write_s(bp, " prediction failed");
@@ -837,7 +1111,7 @@ static int analyze_instruction(sample_t *sample_q, int num_samples, int rst_seen
 
    }
 
-   total_cycles += num_cycles;
+   total_cycles += real_cycles;
    return num_cycles;
 }
 
@@ -865,14 +1139,14 @@ int decode_instruction(sample_t *sample_q, int num_samples) {
    }
 
    // If the first sample is not an SYNC, then drop the sample
-   if (sample_q->type != OPCODE && sample_q->type != UNKNOWN) {
+   if (arguments.cpu_type != CPU_SCMP && sample_q->type != OPCODE && sample_q->type != UNKNOWN) {
       return 1;
    }
 
    // Flag to indicate the sample type is missing (sync/vda/vpa unconnected)
    int notype = sample_q[0].type == UNKNOWN;
 
-   if (sample_q[0].rst < 0) {
+   if (sample_q[0].rst < 0 && arguments.vec_rst != UNDEFINED) {
       // We use a heuristic, based on what we expect to see on the data
       // bus in cycles 5, 6 and 7, i.e. RSTVECL, RSTVECH, RSTOPCODE
       int veclo  = (arguments.vec_rst      ) & 0xff;
@@ -901,15 +1175,24 @@ int decode_instruction(sample_t *sample_q, int num_samples) {
       }
       if (notype) {
          // Do this by dead reconning
-         rst_seen = (arguments.cpu_type == CPU_65C02 || arguments.cpu_type == CPU_65C02_ROCKWELL) ? 8 : 9;
+         rst_seen = cpu_rst_delay[arguments.cpu_type];
          // We could also check the vector
       } else {
-         if (sample_q[7].type == OPCODE) {
-            rst_seen = 7;
-         } else {
-            printf("Instruction after rst /= 7 cycles\n");
-            rst_seen = 0;
-         }
+         // if (sample_q[7].type == OPCODE) {
+         //    rst_seen = 7;
+         // } else {
+         //    printf("Instruction after rst /= 7 cycles\n");
+         //    rst_seen = 0;
+         // }
+         for (int i = 1; i < DEPTH; i++) {
+            if (sample_q[i].type == OPCODE) {
+               rst_seen = i;
+               if (arguments.cpu_type != CPU_SCMP && i != 7) {
+                  printf("Instruction after rst /= 7 cycles\n");
+               }
+               break;
+            }
+          }
       }
    }
 
@@ -928,9 +1211,63 @@ int decode_instruction(sample_t *sample_q, int num_samples) {
 // Queue a small number of samples so the decoders can lookahead
 // ====================================================================
 
-void queue_sample(sample_t *sample) {
+void queue_sample_blocked(sample_t *sample) {
+   //static int synced = 0;
+   int block = arguments.block;
+
+   // Make a copy of the sample structure
+   *sample_wr++ = *sample;
+
+   // At the end of the stream, allow the buffered samples to drain
+   if (sample->type == LAST) {
+      // Try to synchronize to the instruction stream
+      //if (!synced) {
+      //   sample_rd = synchronize_to_stream(sample_rd, sample_wr - sample_rd);
+      //}
+      // Drain the queue when the LAST marker is seen
+      while (sample_rd < sample_wr) {
+         sample_rd += decode_instruction(sample_rd, sample_wr - sample_rd);
+      }
+      return;
+   }
+
+   // Sample_q is NOT a circular buffer!
+   //
+   // When we have two full blocks, we can start to consume the first. Once the first is
+   // consumed, we can move everything back in the block.
+   if (sample_wr > sample_q + 2 * block) {
+      // Try to synchronize to the instruction stream
+      //if (!synced) {
+      //   sample_rd = synchronize_to_stream(sample_rd, sample_wr - sample_rd);
+      //   synced = 1;
+      //}
+      while (sample_rd < sample_q + block) {
+         sample_rd += decode_instruction(sample_rd, sample_wr - sample_rd);
+      }
+      // The first block has been processed, so move everything down a block
+      //printf("Block processed\n");
+      //printf("  sample_wr = %ld\n", sample_wr - sample_q);
+      //printf("  sample_rd = %ld\n", sample_rd - sample_q);
+      memmove(sample_q, sample_q + block, sizeof(sample_t) * (sample_wr - sample_q - block));
+      sample_rd -= block;
+      sample_wr -= block;
+      //printf("Block consumed\n");
+      //printf("  sample_wr = %ld\n", sample_wr - sample_q);
+      //printf("  sample_rd = %ld\n", sample_rd - sample_q);
+   }
+}
+
+void queue_sample_orig(sample_t *sample) {
    static sample_t sample_q[DEPTH];
    static int index = 0;
+
+   // This helped when clock noise affected Arlet's core
+   // (a better fix was to add 100pF cap to the clock)
+   //
+   // if (index > 0 && sample_q[index - 1].type == OPCODE && sample->type == OPCODE) {
+   //    printf("Skipping duplicate SYNC\n");
+   //    return;
+   // }
 
    sample_q[index++] = *sample;
 
@@ -962,40 +1299,92 @@ void queue_sample(sample_t *sample) {
 // Input file processing and bus cycle extraction
 // ====================================================================
 
+static int min(int a, int b) {
+   return (a < b) ? a : b;
+}
+
+static int max(int a, int b) {
+   return (a > b) ? a : b;
+}
+
+static sample_type_t build_sample_type_default(uint16_t sample, int idx_vpa, int idx_vda, int idx_sync) {
+   if (c816) {
+      if (idx_vpa < 0 || idx_vda < 0) {
+         return UNKNOWN;
+      } else if ((sample >> idx_vpa) & 1) {
+         if ((sample >> idx_vda) & 1) {
+            return OPCODE;
+         } else {
+            return PROGRAM;
+         }
+      } else {
+         if ((sample >> idx_vda) & 1) {
+            return DATA;
+         } else {
+            return INTERNAL;
+         }
+      }
+   } else {
+      if (idx_sync < 0) {
+         return UNKNOWN;
+      } else if ((sample >> idx_sync) & 1) {
+         return OPCODE;
+      } else {
+         return DATA;
+      }
+   }
+}
+
+static sample_type_t build_sample_type_scmp(uint16_t sample, int idx_ads, int idx_data) {
+   if (idx_ads < 0) {
+      return UNKNOWN;
+   } else if ((((sample >> idx_ads) & 1) == 0) && (((sample >> idx_data) & 0xF0) == 0x30)) {
+      return OPCODE;
+   } else {
+      return DATA;
+   }
+}
+
 void decode(FILE *stream) {
+
+   // Function pointer to the queue_sample method
+   queue_sample_t queue_sample;
+
+   if (arguments.cpu_type == CPU_SCMP) {
+      queue_sample = queue_sample_blocked;
+   } else {
+      queue_sample = queue_sample_orig;
+   }
 
    // Pin mappings into the 16 bit words
    int idx_data  = arguments.idx_data;
    int idx_rnw   = arguments.idx_rnw ;
    int idx_sync  = arguments.idx_sync;
-   int idx_rdy   = arguments.idx_rdy ;
-   int idx_phi2  = arguments.idx_phi2;
+   int idx_rdy   = (arguments.cpu_type == CPU_SCMP) ? arguments.idx_hold : arguments.idx_rdy;
+   int idx_user  = arguments.idx_user;
    int idx_rst   = arguments.idx_rst;
    int idx_vda   = arguments.idx_vda;
    int idx_vpa   = arguments.idx_vpa;
    int idx_e     = arguments.idx_e;
+   int idx_ads   = arguments.idx_ads;
+   int idx_sa    = arguments.idx_sa;
+   int idx_sb    = arguments.idx_sb;
+   int idx_sin   = arguments.idx_sin;
 
-   // Default Pin values
-   int bus_data  =  0;
-   int pin_rnw   =  1;
-   int pin_sync  =  0;
-   int pin_rdy   =  1;
-   int pin_phi2  =  0;
-   int pin_rst   =  1;
-   int pin_vda   =  0;
-   int pin_vpa   =  0;
-   int pin_e     =  0;
+   // Invert RDY polarity on the 6800 to allow it to be driven from BA
+   int rdy_pol = (arguments.cpu_type == CPU_6800 || arguments.cpu_type == CPU_SCMP) ? 0 : 1;
 
-   int num;
+   // Handle clock inversion of phi1 used rather than phi2
+   int idx_phi = -1;
+   int clk_pol = 0;
+   if (arguments.idx_phi1 >= 0) {
+      idx_phi = arguments.idx_phi1;
+      clk_pol = 1;
+   } else if (arguments.idx_phi2 >= 0) {
+      idx_phi = arguments.idx_phi2;
+   }
 
-   // The previous sample of the 16-bit capture (async sampling only)
-   uint16_t sample       = -1;
-   uint16_t last_sample  = -1;
-   uint16_t last2_sample = -1;
-
-   // The previous sample of phi2 (async sampling only)
-   int last_phi2 = -1;
-
+   // The structured bus sample we will pass on to the next level of processing
    sample_t s;
 
    // Skip the start of the file, if required
@@ -1003,184 +1392,190 @@ void decode(FILE *stream) {
       fseek(stream, arguments.skip * (arguments.byte ? 1 : 2), SEEK_SET);
    }
 
+   // Common to all sampling modes
+   s.type = UNKNOWN;
+   s.sample_count = 1;
+   s.cycle_count = 1;
+   s.rnw  = -1;
+   s.rst  = -1;
+   s.e    = -1;
+   s.user = -1;
+   s.sa   = -1;
+   s.sb   = -1;
+   s.sin  = -1;
+
    if (arguments.byte) {
-      s.rnw = -1;
-      s.rst = -1;
-      s.type = UNKNOWN;
+
+      // ------------------------------------------------------------
+      // Synchronous byte sampling mode
+      // ------------------------------------------------------------
 
       // In byte mode we have only data bus samples, nothing else so we must
-      // use the sync-less decoder. The values of pin_rnw and pin_rst are set
-      // to 1, but the decoder should never actually use them.
+      // use the sync-less decoder. All the control signals should be marked
+      // as disconnected, by being set to -1.
 
+      // Read the capture file, and queue structured sampled for the decoder
+      int num;
       while ((num = fread(buffer8, sizeof(uint8_t), BUFSIZE, stream)) > 0) {
          uint8_t *sampleptr = &buffer8[0];
          while (num-- > 0) {
             s.data = *sampleptr++;
             queue_sample(&s);
+            s.sample_count++;
+            s.cycle_count++;
+         }
+      }
+
+   } else if (idx_phi < 0 ) {
+
+      // ------------------------------------------------------------
+      // Synchronous word sampling mode
+      // ------------------------------------------------------------
+
+      // In word sampling mode we have data bus samples, plus
+      // optionally rnw, sync, rdy, phy2 and rst.
+
+      // In synchronous word sampling mode clke is not connected, and
+      // it's assumed that each sample represents a seperate bus
+      // cycle.
+
+      // Read the capture file, and queue structured sampled for the decoder
+      int num;
+      while ((num = fread(buffer, sizeof(uint16_t), BUFSIZE, stream)) > 0) {
+         uint16_t *sampleptr = &buffer[0];
+         while (num-- > 0) {
+            uint16_t sample = *sampleptr++;
+            // Drop samples where RDY=0 (or BA=1 for 6800)
+            if (idx_rdy < 0 || (((sample >> idx_rdy) & 1) == rdy_pol)) {
+               if (arguments.cpu_type == CPU_SCMP) {
+                  s.type = build_sample_type_scmp(sample, idx_ads, idx_data);
+                  if (idx_sa >= 0) {
+                     s.sa = (sample >> idx_sa) & 1;
+                  }
+                  if (idx_sb >= 0) {
+                     s.sb = (sample >> idx_sb) & 1;
+                  }
+                  if (idx_sin >= 0) {
+                     s.sin = (sample >> idx_sin) & 1;
+                  }
+               } else {
+                  s.type = build_sample_type_default(sample, idx_vpa, idx_vda, idx_sync);
+               }
+               if (idx_rnw >= 0) {
+                  s.rnw = (sample >> idx_rnw ) & 1;
+               }
+               if (idx_rst >= 0) {
+                  s.rst = (sample >> idx_rst) & 1;
+               }
+               if (idx_e >= 0) {
+                  s.e = (sample >> idx_e) & 1;
+               }
+               if (idx_user >= 0) {
+                  s.user = (sample >> idx_user) & 1;
+               }
+               s.data = (sample >> idx_data) & 255;
+               queue_sample(&s);
+            }
+            s.sample_count++;
+            s.cycle_count++;
          }
       }
 
    } else {
 
-      // In word mode (the default) we have data bus samples, plus optionally
-      // rnw, sync, rdy, phy2 and rst.
+      // ------------------------------------------------------------
+      // Asynchronous word sampling mode
+      // ------------------------------------------------------------
 
+      // In word sampling mode we have data bus samples, plus
+      // optionally rnw, sync, rdy, phy2 and rst.
+
+      // In asynchronous word sampling mode clke is connected, and
+      // the capture file contans multple samples per bus cycle.
+
+      // The previous value of clke, to detect the rising/falling edge
+      int last_phi2 = -1;
+
+      // A small circular buffer for skewing the sampling of the data bus
+      uint16_t skew_buffer  [SKEW_BUFFER_SIZE];
+
+      // Minimize the amount of buffering to avoid unnecessary garbage
+      int min_skew = min(arguments.skew_rd, arguments.skew_wr);
+      int max_skew = max(arguments.skew_rd, arguments.skew_wr);
+
+      int tail        = max(0, max_skew);
+      int head        = 0;
+      int rddata_head = arguments.skew_rd;
+      int wrdata_head = arguments.skew_wr;
+
+      // If any of the skews are negative, then increase all by this amount so they are all positive
+      if (min_skew < 0) {
+         tail        = (       tail - min_skew) & (SKEW_BUFFER_SIZE - 1);
+         head        = (       head - min_skew) & (SKEW_BUFFER_SIZE - 1);
+         rddata_head = (rddata_head - min_skew) & (SKEW_BUFFER_SIZE - 1);
+         wrdata_head = (wrdata_head - min_skew) & (SKEW_BUFFER_SIZE - 1);
+      }
+
+      // Clear the buffer, so the first few samples are ignored
+      for (int i = 0; i < SKEW_BUFFER_SIZE; i++) {
+         skew_buffer[i] = 0;
+      }
+
+      // Read the capture file, and queue structured sampled for the decoder
+      int num;
       while ((num = fread(buffer, sizeof(uint16_t), BUFSIZE, stream)) > 0) {
-
          uint16_t *sampleptr = &buffer[0];
-
          while (num-- > 0) {
-
-            // The current 16-bit capture sample, and the previous two
-            last2_sample = last_sample;
-            last_sample  = sample;
-            sample       = *sampleptr++;
-
-            // TODO: fix the hard coded values!!!
-            //if (arguments.debug & 4) {
-            //   printf("%d %02x %x %x %x %x\n", sample_count, sample&255, (sample >> 8)&1,  (sample >> 9)&1,  (sample >> 10)&1,  (sample >> 11)&1  );
-            //}
-            sample_count++;
-
-            // Phi2 is optional
-            // - if asynchronous capture is used, it must be connected
-            // - if synchronous capture is used, it must not connected
-            if (idx_phi2 < 0) {
-
-               // If Phi2 is not present, use the pins directly
-               bus_data = (sample >> idx_data) & 255;
-               if (idx_rnw >= 0) {
-                  pin_rnw = (sample >> idx_rnw ) & 1;
-               }
-               if (c816) {
-                  if (idx_vda >= 0) {
-                     pin_vda = (sample >> idx_vda) & 1;
-                  }
-                  if (idx_vpa >= 0) {
-                     pin_vpa = (sample >> idx_vpa) & 1;
-                  }
-                  if (idx_e >= 0) {
-                     pin_e = (sample >> idx_e) & 1;
-                  }
-               } else {
-                  if (idx_sync >= 0) {
-                     pin_sync = (sample >> idx_sync) & 1;
-                  }
-               }
-               if (idx_rdy >= 0) {
-                  pin_rdy = (sample >> idx_rdy) & 1;
-               }
-               if (idx_rst >= 0) {
-                  pin_rst = (sample >> idx_rst) & 1;
-               }
-
-            } else {
-
-               // If Phi2 is present, look for an edge
-               pin_phi2 = (sample >> idx_phi2) & 1;
-               if (pin_phi2 == last_phi2) {
-                  // continue for more samples
-                  continue;
-               }
+            skew_buffer[tail] = *sampleptr++;
+            uint16_t sample   = skew_buffer[head];
+            // Only act on edges of phi
+            int pin_phi2 = clk_pol ^ ((sample >> idx_phi) & 1);
+            if (pin_phi2 != last_phi2) {
                last_phi2 = pin_phi2;
-
                if (pin_phi2) {
-                  // sample control signals just after rising edge of Phi2
-                  if (!c816) {
-                     if (idx_rnw >= 0) {
-                        pin_rnw = (sample >> idx_rnw ) & 1;
+                  // Sample control signals after rising edge of PHI2
+                  // Note: this is a change for the 65816, but should be fine timing wise
+                  if (arguments.cpu_type == CPU_SCMP) {
+                     s.type = build_sample_type_scmp(sample, idx_ads, idx_data);
+                     if (idx_sa >= 0) {
+                        s.sa = (sample >> idx_sa) & 1;
                      }
-                     if (idx_sync >= 0) {
-                        pin_sync = (sample >> idx_sync) & 1;
+                     if (idx_sb >= 0) {
+                        s.sb = (sample >> idx_sb) & 1;
                      }
-                     if (idx_rst >= 0) {
-                        pin_rst = (sample >> idx_rst) & 1;
-                     }
-                  }
-                  // continue for more samples
-                  continue;
-               } else {
-                  if (idx_rdy >= 0) {
-                     pin_rdy = (last_sample >> idx_rdy) & 1;
-                  }
-                  if (c816) {
-                     if (idx_rnw >= 0) {
-                        pin_rnw = (last_sample >> idx_rnw ) & 1;
-                     }
-                     if (idx_vda >= 0) {
-                        pin_vda = (last_sample >> idx_vda) & 1;
-                     }
-                     if (idx_vpa >= 0) {
-                        pin_vpa = (last_sample >> idx_vpa) & 1;
-                     }
-                     if (idx_e >= 0) {
-                        pin_e = (last_sample >> idx_e) & 1;
-                     }
-                     if (idx_rst >= 0) {
-                        pin_rst = (last_sample >> idx_rst) & 1;
-                     }
-                     // sample data just before falling edge of Phi2
-                     bus_data = last_sample & 255;
-                  } else if (arguments.machine == MACHINE_ELK) {
-                     // sample data just before falling edge of Phi2
-                     bus_data = last_sample & 255;
-                  } else if (arguments.machine == MACHINE_MASTER) {
-                     // Data bus sampling for the Master
-                     if (idx_rnw < 0 || pin_rnw) {
-                        // sample read data just before falling edge of Phi2
-                        bus_data = last_sample & 255;
-                     } else {
-                        // sample write data one cycle earlier
-                        bus_data = last2_sample & 255;
+                     if (idx_sin >= 0) {
+                        s.sin = (sample >> idx_sin) & 1;
                      }
                   } else {
-                     // Data bus sampling for the Beeb, one cycle later
-                     if (idx_rnw < 0 || pin_rnw) {
-                        // sample read data just after falling edge of Phi2
-                        bus_data = sample & 255;
-                     } else {
-                        // sample write data one cycle earlier
-                        bus_data = last_sample & 255;
-                     }
+                     s.type = build_sample_type_default(sample, idx_vpa, idx_vda, idx_sync);
                   }
-               }
-            }
-
-            // Ignore the cycle if RDY is low
-            if (pin_rdy == 0)
-               continue;
-
-            // Build the sample
-            if (c816) {
-               if (idx_vda < 0 || idx_vpa < 0) {
-                  s.type = UNKNOWN;
+                  if (idx_rnw >= 0) {
+                     s.rnw = (sample >> idx_rnw ) & 1;
+                  }
+                  if (idx_rst >= 0) {
+                     s.rst = (sample >> idx_rst) & 1;
+                     }
+                  if (idx_e >= 0) {
+                     s.e = (sample >> idx_e) & 1;
+                  }
+                  if (idx_user >= 0) {
+                     s.user = (sample >> idx_user) & 1;
+                  }
                } else {
-                  s.type = pin_vpa ? (pin_vda ? OPCODE : PROGRAM) : (pin_vda ? DATA : INTERNAL);
+                  if (idx_rdy < 0 || ((sample >> idx_rdy) & 1)) {
+                     // Sample the data skewed (--skew=) relative to the falling edge of PHI2
+                     s.data = (skew_buffer[s.rnw == 0 ? wrdata_head : rddata_head] >> idx_data) & 255;
+                     queue_sample(&s);
+                  }
+                  s.cycle_count++;
                }
-            } else {
-               if (idx_sync < 0) {
-                  s.type = UNKNOWN;
-               } else {
-                  s.type = pin_sync ? OPCODE : DATA;
-               }
             }
-            s.data = bus_data;
-            if (idx_rnw < 0) {
-               s.rnw = -1;
-            } else {
-               s.rnw = pin_rnw;
-            }
-            if (idx_rst < 0) {
-               s.rst = -1;
-            } else {
-               s.rst = pin_rst;
-            }
-            if (idx_e < 0) {
-               s.e = -1;
-            } else {
-               s.e = pin_e;
-            }
-            queue_sample(&s);
+            s.sample_count++;
+            // Increment the circular buffer pointers in lock-step to keey the skew constant
+            tail        = (tail        + 1) & (SKEW_BUFFER_SIZE - 1);
+            head        = (head        + 1) & (SKEW_BUFFER_SIZE - 1);
+            rddata_head = (rddata_head + 1) & (SKEW_BUFFER_SIZE - 1);
+            wrdata_head = (wrdata_head + 1) & (SKEW_BUFFER_SIZE - 1);
          }
       }
    }
@@ -1196,6 +1591,12 @@ void decode(FILE *stream) {
 // ====================================================================
 
 int main(int argc, char *argv[]) {
+
+   int i;
+   char name[100];
+   int type;
+   struct argp *argp;
+
    // General options
    arguments.cpu_type         = CPU_UNKNOWN;
    arguments.machine          = MACHINE_DEFAULT;
@@ -1206,6 +1607,9 @@ int main(int argc, char *argv[]) {
    arguments.debug            = 0;
    arguments.mem_model        = 0;
    arguments.skip             = 0;
+   arguments.block            = DEFAULT_BLOCK;
+   arguments.skew_rd          = UNSPECIFIED;
+   arguments.skew_wr          = UNSPECIFIED;
    arguments.profile          = 0;
    arguments.trigger_start    = UNSPECIFIED;
    arguments.trigger_stop     = UNSPECIFIED;
@@ -1219,20 +1623,20 @@ int main(int argc, char *argv[]) {
    arguments.show_state       = 0;
    arguments.show_bbcfwa      = 0;
    arguments.show_cycles      = 0;
+   arguments.show_samplenums  = 0;
 
    // Signal definition options
    arguments.idx_data         = UNSPECIFIED;
    arguments.idx_rnw          = UNSPECIFIED;
-   arguments.idx_sync         = UNSPECIFIED;
-   arguments.idx_vpa          = UNSPECIFIED;
    arguments.idx_rdy          = UNSPECIFIED;
-   arguments.idx_vda          = UNSPECIFIED;
-   arguments.idx_e            = UNSPECIFIED;
    arguments.idx_rst          = UNSPECIFIED;
+   arguments.idx_phi1         = UNSPECIFIED;
    arguments.idx_phi2         = UNSPECIFIED;
+   arguments.idx_user         = UNSPECIFIED;
 
    // Additional 6502 options
    arguments.undocumented     = 0;
+   arguments.idx_sync         = UNSPECIFIED;
 
    // Additional 65816 options
    arguments.pb_reg           = UNSPECIFIED;
@@ -1241,14 +1645,73 @@ int main(int argc, char *argv[]) {
    arguments.e_flag           = UNSPECIFIED;
    arguments.ms_flag          = UNSPECIFIED;
    arguments.xs_flag          = UNSPECIFIED;
+   arguments.idx_vpa          = UNSPECIFIED;
+   arguments.idx_vda          = UNSPECIFIED;
+   arguments.idx_e            = UNSPECIFIED;
 
-   argp_parse(&argp, argc, argv, 0, 0, &arguments);
+   // Additional SC/MP options
+   arguments.clkdiv           = UNSPECIFIED;
+   arguments.psr_reg          = UNSPECIFIED;
+   arguments.idx_ads          = UNSPECIFIED;
+   arguments.idx_hold         = UNSPECIFIED;
+   arguments.idx_sa           = UNSPECIFIED;
+   arguments.idx_sb           = UNSPECIFIED;
+   arguments.idx_sin          = UNSPECIFIED;
+
+   // Build documentation for supported machine types
+   strcat(machines_doc, "Supported machine types:\n");
+   i = 0;
+   while (machine_names[i]) {
+      strcat(machines_doc,  "    ");
+      strcat(machines_doc,  machine_names[i]);
+      strcat(machines_doc,  "\n");
+      i++;
+   }
+
+   // Build documentation for supported CPU types
+   strcat(cpus_doc, "Supported CPU types:");
+   i = 0;
+   type = -1;
+   while (cpu_names[i].cpu_name) {
+      sprintf(name, "%-10s", cpu_names[i].cpu_name);
+      if (((int)cpu_names[i].cpu_type) != type) {
+         // Start a new type line
+         type = cpu_names[i].cpu_type;
+         strcat(cpus_doc,  "\n    ");
+         strcat(cpus_doc,  name);
+         strcat(cpus_doc,  "aliases:");
+      } else {
+         strcat(cpus_doc,  " ");
+         strcat(cpus_doc,  cpu_names[i].cpu_name);
+      }
+      i++;
+   }
+   strcat(cpus_doc,  "\n");
+
+   // Merge all documentation into a single string
+   char *extended_doc = (char *)malloc(strlen(doc) + strlen(cpus_doc) + strlen(cpus_doc) + 100);
+   strcpy(extended_doc, doc);
+   strcat(extended_doc, machines_doc);
+   strcat(extended_doc,  "\n");
+   strcat(extended_doc, cpus_doc);
+
+   argp = (struct argp *) malloc(sizeof(struct argp));
+   argp->options = options;
+   argp->parser = parse_opt;
+   argp->args_doc = args_doc;
+   argp->doc = extended_doc;
+   argp_parse(argp, argc, argv, 0, 0, &arguments);
 
    if (arguments.trigger_start < 0) {
       triggered = 1;
    }
 
-   arguments.show_something = arguments.show_address | arguments.show_hex | arguments.show_instruction | arguments.show_state | arguments.show_bbcfwa | arguments.show_cycles;
+   arguments.show_something = arguments.show_samplenums | arguments.show_address | arguments.show_hex | arguments.show_instruction | arguments.show_state | arguments.show_bbcfwa | arguments.show_cycles;
+
+   // Allocate sample buffer (3 blocks)
+   sample_q = malloc(arguments.block * sizeof(sample_t) * 3);
+   sample_rd = sample_q;
+   sample_wr = sample_q;
 
    // Normally the data file should be 16 bit samples. In byte mode
    // the data file is 8 bit samples, and all the control signals are
@@ -1260,6 +1723,10 @@ int main(int argc, char *argv[]) {
       }
       if (arguments.idx_sync != UNSPECIFIED) {
          fprintf(stderr, "--sync is incompatible with byte mode\n");
+         return 1;
+      }
+      if (arguments.idx_phi1 != UNSPECIFIED) {
+         fprintf(stderr, "--phi1 is incompatible with byte mode\n");
          return 1;
       }
       if (arguments.idx_phi2 != UNSPECIFIED) {
@@ -1300,8 +1767,14 @@ int main(int argc, char *argv[]) {
       case MACHINE_ELK:
          arguments.vec_rst = 0xA9D8D2;
          break;
+      case MACHINE_ATOM:
+         arguments.vec_rst = 0xA2FF3F;
+         break;
+      case MACHINE_MEK6800D2:
+         arguments.vec_rst = 0x8E8DE0;
+         break;
       default:
-         arguments.vec_rst = 0xFFFFFF;
+         arguments.vec_rst = UNDEFINED;
       }
    }
    if (arguments.cpu_type == CPU_UNKNOWN) {
@@ -1309,21 +1782,27 @@ int main(int argc, char *argv[]) {
       case MACHINE_MASTER:
          arguments.cpu_type = CPU_65C02;
          break;
+      case MACHINE_MEK6800D2:
+         arguments.cpu_type = CPU_6800;
+         break;
       default:
          arguments.cpu_type = CPU_6502;
          break;
       }
    }
 
+   int memory_size;
    // Initialize memory modelling
    // (em->init actually mallocs the memory)
    if (arguments.cpu_type == CPU_65C816) {
       // 16MB
-      memory_init(0x1000000, arguments.machine, arguments.bbctube);
+      memory_size = 0x1000000;
    } else {
       // 64KB
-      memory_init(0x10000, arguments.machine, arguments.bbctube);
+      memory_size = 0x10000;
    }
+
+   memory_init(memory_size, arguments.machine, arguments.bbctube);
 
    // Turn on memory write logging if show rom bank option (-r) is selected
    if (arguments.show_romno) {
@@ -1334,9 +1813,15 @@ int main(int argc, char *argv[]) {
    memory_set_rd_logging((arguments.mem_model >> 4) & 0x0f);
    memory_set_wr_logging((arguments.mem_model >> 8) & 0x0f);
 
+   // Load the swift format symbol file
+   if (arguments.labels_file) {
+      symbol_init(memory_size);
+      symbol_import_swift(arguments.labels_file);
+   }
+
    // Validate options compatibility with CPU
-   if (arguments.cpu_type != CPU_6502 && arguments.undocumented) {
-      fprintf(stderr, "--undocumented is only applicable to the 6502\n");
+   if (arguments.cpu_type != CPU_6502 && arguments.cpu_type != CPU_6800 && arguments.cpu_type != CPU_SCMP && arguments.undocumented) {
+      fprintf(stderr, "--undocumented is only applicable to the 6502/6800/SCMP\n");
       return 1;
    }
    if (arguments.cpu_type == CPU_65C816) {
@@ -1393,37 +1878,95 @@ int main(int argc, char *argv[]) {
    if (arguments.idx_sync == UNSPECIFIED) {
       arguments.idx_sync = 9;
    }
+   if (arguments.idx_ads == UNSPECIFIED) {
+      arguments.idx_ads = 9; // SC/MP only
+   }
    if (arguments.idx_vpa == UNSPECIFIED) {
       arguments.idx_vpa = 9;
    }
    if (arguments.idx_rdy == UNSPECIFIED) {
       arguments.idx_rdy = 10;
    }
+   if (arguments.idx_hold == UNSPECIFIED) {
+      arguments.idx_hold = 10; // SC/MP only
+   }
    if (arguments.idx_vda == UNSPECIFIED) {
       arguments.idx_vda = 11;
+   }
+   if (arguments.idx_sa == UNSPECIFIED) {
+      arguments.idx_sa = 11; // SC/MP only
    }
    if (arguments.idx_e == UNSPECIFIED) {
       arguments.idx_e = 12;
    }
+   if (arguments.idx_sb == UNSPECIFIED) {
+      arguments.idx_sb = 12; // SC/MP only
+   }
+   if (arguments.idx_sin == UNSPECIFIED) {
+      arguments.idx_sin = 13; // SC/MP only
+   }
    if (arguments.idx_rst == UNSPECIFIED) {
       arguments.idx_rst = 14;
    }
-   if (arguments.idx_phi2 == UNSPECIFIED) {
+   // Flag conflicting use of --phi1 and --phi2
+   if (arguments.idx_phi1 >= 0 && arguments.idx_phi2 >= 0) {
+      fprintf(stderr, "--phi1 and --phi2 cannot both be assigned to pins\n");
+      return 1;
+   }
+   // Only default phi2 if phi1 is not assigned to a pin
+   if (arguments.idx_phi2 == UNSPECIFIED && arguments.idx_phi1 < 0) {
       arguments.idx_phi2 = 15;
    }
 
+   if (arguments.skew_rd == UNSPECIFIED) {
+      switch (arguments.machine) {
+      case MACHINE_BEEB:
+         arguments.skew_rd =  0; // sample after Phi2 falls
+         break;
+      case MACHINE_MASTER:
+         arguments.skew_rd = -1; // sample before PHI2 fails
+         break;
+      default:
+         arguments.skew_rd = -1; // sample before PHI2 fails
+         break;
+      }
+   }
+   if (arguments.skew_wr == UNSPECIFIED) {
+      switch (arguments.machine) {
+      case MACHINE_BEEB:
+         arguments.skew_wr = -1; // sample before PHI2 fails
+         break;
+      case MACHINE_MASTER:
+         arguments.skew_wr = -2; // sample well before PHI2 fails
+         break;
+      default:
+         arguments.skew_wr = -1; // sample before PHI2 fails
+         break;
+      }
+   }
+
+   if (arguments.clkdiv == UNSPECIFIED) {
+      arguments.clkdiv = (arguments.cpu_type == CPU_SCMP) ? 4 : 1;
+   }
+
+   c816 = 0;
    if (arguments.cpu_type == CPU_65C816) {
       c816 = 1;
       em = &em_65816;
+   } else if (arguments.cpu_type == CPU_6800) {
+      em = &em_6800;
+   } else if (arguments.cpu_type == CPU_SCMP) {
+      em = &em_scmp;
    } else {
-      c816 = 0;
       em = &em_6502;
    }
+
+   arlet = (arguments.cpu_type == CPU_6502_ARLET || arguments.cpu_type == CPU_65C02_ARLET);
 
    em->init(&arguments);
 
    if (arguments.profile) {
-      profiler_init();
+      profiler_init(em);
    }
 
    FILE *stream;
@@ -1436,8 +1979,6 @@ int main(int argc, char *argv[]) {
          return 2;
       }
    }
-
-
 
    decode(stream);
    fclose(stream);

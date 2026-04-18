@@ -2,6 +2,7 @@
 #include <inttypes.h>
 
 #include "profiler.h"
+#include "symbols.h"
 
 extern profiler_t *profiler_instr_create(char *arg);
 extern profiler_t *profiler_block_create(char *arg);
@@ -38,10 +39,10 @@ static int active_count = 0;
    }
 }
 
-void profiler_init() {
+void profiler_init(cpu_emulator_t *em) {
    profiler_t **pp = active_list;
    while (*pp) {
-      (*pp)->init(*pp);
+      (*pp)->init(*pp, em);
       pp++;
    }
 }
@@ -65,14 +66,17 @@ void profiler_done() {
    }
 }
 
-void profiler_output_helper(address_t *profile_counts, int show_bars, int show_other) {
+void profiler_output_helper(address_t *profile_counts, int show_bars, int show_other, cpu_emulator_t *em) {
    address_t      *ptr;
 
    uint32_t   max_cycles = 0;
    uint64_t total_cycles = 0;
+   uint64_t page_crossing_cycles = 0;
    uint64_t  total_instr = 0;
    double  total_percent = 0.0;
    double      bar_scale;
+
+   char buffer[256];
 
    ptr = profile_counts;
 
@@ -82,6 +86,18 @@ void profiler_output_helper(address_t *profile_counts, int show_bars, int show_o
       }
       total_cycles += ptr->cycles;
       total_instr += ptr->instructions;
+      if (em && ptr->cycles) {
+         int opcode = em->read_memory(addr);
+         // TODO: BRA (0x80) should only be counted on the C02/C816
+         if (((opcode & 0x1f) == 0x10) || (opcode == 0x80)) {
+            int offset = em->read_memory(addr + 1);
+            // Is the target in a different page?
+            if (((addr + 2) & 0xff00) != ((addr + 2 + (int8_t)offset) & 0xff00)) {
+               // A small amount of maths gives us the cycles that could be saved if the branch were in the same page
+               page_crossing_cycles += (ptr->cycles - 2 * ptr->instructions) / 2;
+            }
+         }
+      }
       ptr++;
    }
 
@@ -89,6 +105,10 @@ void profiler_output_helper(address_t *profile_counts, int show_bars, int show_o
 
    ptr = profile_counts;
    for (int addr = 0; addr <= OTHER_CONTEXT; addr++) {
+      char *name = symbol_lookup(addr);
+      if (name) {
+         printf("\n%s\n", name);
+      }
       if (ptr->cycles) {
          double percent = 100.0 * (ptr->cycles) / (double) total_cycles;
          total_percent += percent;
@@ -96,6 +116,18 @@ void profiler_output_helper(address_t *profile_counts, int show_bars, int show_o
             printf("****");
          } else {
             printf("%04x", addr);
+            if (em) {
+               instruction_t instruction;
+               instruction.pc     = addr;
+               instruction.opcode = em->read_memory(addr);
+               instruction.op1    = em->read_memory(addr + 1);
+               instruction.op2    = em->read_memory(addr + 2);
+               int n = em->disassemble(buffer, &instruction);
+               printf(" %s", buffer);
+               for (int i = n; i < 12; i++) {
+                  putchar(' ');
+               }
+            }
          }
          printf(" : %8d cycles (%10.6f%%) %8d ins (%4.2f cpi)", ptr->cycles, percent, ptr->instructions, (double) ptr->cycles / (double) ptr->instructions);
          if (show_other) {
@@ -122,4 +154,5 @@ void profiler_output_helper(address_t *profile_counts, int show_bars, int show_o
       ptr++;
    }
    printf("     : %8" PRIu64 " cycles (%10.6f%%) %8" PRIu64 " ins (%4.2f cpi)\n", total_cycles, total_percent, total_instr, (double) total_cycles / (double) total_instr);
+   printf("     : %8" PRIu64 " branch page crossing cycles (%10.6f%%)\n",page_crossing_cycles, (double) page_crossing_cycles * 100.0 / (double) total_cycles);
 }

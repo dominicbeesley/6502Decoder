@@ -118,7 +118,7 @@ AddrModeType addr_mode_table[] = {
    {4,    "%1$s %4$02X%3$02X%2$02X,X"},// ABLX
    {3,    "%1$s [%3$02X%2$02X]"},      // IAL
    {3,    "%1$s %2$s"},                // BRL
-   {3,    "%1$s %2$02X,%3$02X"},       // BM
+   {3,    "%1$s %3$02X,%2$02X"},       // BM
    {1,    "%1$s"},                     // IMP
    {1,    "%1$s A"},                   // IMPA
    {2,    "%1$s %2$s"},                // BRA
@@ -262,6 +262,17 @@ static void check_FLAGS(int operand) {
    failflag |= compare_FLAGS(operand);
 }
 
+static void x_flag_updated() {
+   if (XS) {
+      if (X >= 0) {
+         X &= 0x00ff;
+      }
+      if (Y >= 0) {
+         Y &= 0x00ff;
+      }
+   }
+}
+
 static void set_FLAGS(int operand) {
    N = (operand >> 7) & 1;
    V = (operand >> 6) & 1;
@@ -272,6 +283,7 @@ static void set_FLAGS(int operand) {
       MS = 1;
       XS = 1;
    }
+   x_flag_updated();
    D = (operand >> 3) & 1;
    I = (operand >> 2) & 1;
    Z = (operand >> 1) & 1;
@@ -373,11 +385,8 @@ static void set_NZ_AB(int A, int B) {
    }
 }
 
-// TODO: Stack wrapping im emulation mode should only happen with "old" instructions
-// e.g. PLB should not wrap
-// See appendix of 65C816 Opcodes by Bruce Clark
-
-static void pop8(int value) {
+// Helper routine to handle incrementing the stack pointer
+static void incSP() {
    // Increment the low byte of SP
    if (SL >= 0) {
       SL = (SL + 1) & 0xff;
@@ -398,21 +407,10 @@ static void pop8(int value) {
    } else {
       SH = -1;
    }
-   // Handle the memory access
-   if (SL >= 0 && SH >= 0) {
-      memory_read(value & 0xff, (SH << 8) + SL, MEM_STACK);
-   }
 }
 
-// TODO: Stack wrapping im emulation mode should only happen with "old" instructions
-// e.g. PLB should not wrap
-// See appendix of 65C816 Opcodes by Bruce Clark
-
-static void push8(int value) {
-   // Handle the memory access
-   if (SL >= 0 && SH >= 0) {
-      memory_write(value & 0xff, (SH << 8) + SL, MEM_STACK);
-   }
+// Helper routine to handle decrementing the stack pointer
+static void decSP() {
    // Decrement the low byte of SP
    if (SL >= 0) {
       SL = (SL - 1) & 0xff;
@@ -435,14 +433,85 @@ static void push8(int value) {
    }
 }
 
+// pop one byte off the stack - used by "old" instructions
+static void pop8(int value) {
+   // Increment/wrap the stack pointer
+   incSP();
+   // Handle the memory access
+   if (SL >= 0 && SH >= 0) {
+      memory_read(value & 0xff, (SH << 8) + SL, MEM_STACK);
+   }
+}
+
+// pop one byte off the stack - used by "new" instructions
+static void pop8new(int value) {
+   // Handle the memory access
+   if (SL >= 0 && SH >= 0) {
+      memory_read(value & 0xff, ((SH << 8) + SL + 1) & 0xffff, MEM_STACK);
+   }
+   // Increment/wrap the stack pointer
+   incSP();
+}
+
+// pop two bytes off the stack - used by "old" instructions
 static void pop16(int value) {
    pop8(value);
    pop8(value >> 8);
 }
 
+
+// pop two bytes off the stack - used by "new" instructions (e.g. PLD)
+static void pop16new(int value) {
+   // Handle the memory access
+   if (SL >= 0 && SH >= 0) {
+      memory_read( value       & 0xff, ((SH << 8) + SL + 1) & 0xffff, MEM_STACK);
+      memory_read((value >> 8) & 0xff, ((SH << 8) + SL + 2) & 0xffff, MEM_STACK);
+   }
+   // Increment/wrap the stack pointer
+   incSP();
+   incSP();
+}
+
+// pop three bytes off the stack - used by "new" instructions (e.g.RTL)
+static void pop24new(int value) {
+   // Handle the memory access
+   if (SL >= 0 && SH >= 0) {
+      memory_read( value        & 0xff, ((SH << 8) + SL + 1) & 0xffff, MEM_STACK); // PCL
+      memory_read((value >>  8) & 0xff, ((SH << 8) + SL + 2) & 0xffff, MEM_STACK); // PCH
+      memory_read((value >> 16) & 0xff, ((SH << 8) + SL + 3) & 0xffff, MEM_STACK); // PBR
+   }
+   // Increment/wrap the stack pointer
+   incSP();
+   incSP();
+   incSP();
+}
+
+// push one byte onto the stack - used by "old" instructions and "new" instructions
+static void push8(int value) {
+   // Handle the memory access
+   if (SL >= 0 && SH >= 0) {
+      memory_write(value & 0xff, (SH << 8) + SL, MEM_STACK);
+   }
+   // Decrement/wrap the stack pointer
+   decSP();
+}
+
+// push two byte onto the stack - used by "old" instructions
 static void push16(int value) {
    push8(value >> 8);
    push8(value);
+}
+
+// push two byte onto the stack - used by "new" instructions
+static void push16new(int value) {
+   // Handle the memory access
+   if (SL >= 0 && SH >= 0) {
+      memory_write((value >> 8) & 0xff, (SH << 8) + SL, MEM_STACK);
+      memory_write(value & 0xff, ((SH << 8) + SL - 1) & 0xffff, MEM_STACK);
+   }
+   // Decrement/wrap the stack pointer
+   decSP();
+   decSP();
 }
 
 static void popXS(int value) {
@@ -450,7 +519,7 @@ static void popXS(int value) {
       SL = -1;
       SH = -1;
    } else if (XS == 0) {
-      pop16(value);
+      pop16(value); // TODO: should be new?
    } else {
       pop8(value);
    }
@@ -461,7 +530,7 @@ static void popMS(int value) {
       SL = -1;
       SH = -1;
    } else if (MS == 0) {
-      pop16(value);
+      pop16(value); // TODO: should be new?
    } else {
       pop8(value);
    }
@@ -626,7 +695,7 @@ static int get_num_cycles(sample_t *sample_q, int intr_seen) {
       }
    }
 
-   // Account for extra cycle in a page crossing in absolute indexed (not stores or rmw) in emulated mode
+   // Account for extra cycle in a page crossing in absolute indexed (not stores or rmw)
    if (((instr->mode == ABSX) || (instr->mode == ABSY)) && (instr->optype == READOP)) {
       int correction = -1;
       int index = (instr->mode == ABSX) ? X : Y;
@@ -638,19 +707,19 @@ static int get_num_cycles(sample_t *sample_q, int intr_seen) {
             correction = 0;
          }
       }
-      // E  C
-      // 1  1    1
-      // ?  ?    ?
-      // ?  1    ?
-      // 1  ?    ?
-      // ?  0    0
-      // 0  ?    0
-      // 0  0    0
-      // 0  1    0
-      // 1  0    0
-      if (E > 0 && correction > 0) {
+      // XS  C
+      //  ?  ?    ?
+      //  ?  0    ?
+      //  ?  1    1
+      //  0  ?    1
+      //  0  0    1
+      //  0  1    1
+      //  1  ?    ?
+      //  1  0    0
+      //  1  1    1
+      if (XS == 0 || correction == 1) {
          cycle_count++;
-      } else if (!(E == 0 || correction == 0)) {
+      } else if (XS < 0 || correction < 0) {
          return -1;
       }
    }
@@ -757,7 +826,7 @@ static int count_cycles_with_sync(sample_t *sample_q, int intr_seen) {
             int expected = get_num_cycles(sample_q, intr_seen);
             if (expected >= 0) {
                if (i != expected) {
-                  printf ("cycle prediction fail: expected %d actual %d\n", expected, i);
+                  printf ("opcode %02x: cycle prediction fail: expected %d actual %d\n", sample_q[0].data, expected, i);
                }
             }
             return i;
@@ -774,12 +843,7 @@ static void emulation_mode_on() {
    }
    MS = 1;
    XS = 1;
-   if (X >= 0) {
-      X &= 0x00ff;
-   }
-   if (Y >= 0) {
-      Y &= 0x00ff;
-   }
+   x_flag_updated();
    SH = 0x01;
    E = 1;
 }
@@ -808,6 +872,7 @@ static void check_and_set_xs(int val) {
       failflag = 1;
    }
    XS = val;
+   x_flag_updated();
    // Evidence of XS = 0 implies E = 0
    if (XS == 0) {
       emulation_mode_off();
@@ -878,10 +943,6 @@ static void em_65816_init(arguments_t *args) {
          for (int j = 0; m1_ops[j]; j++) {
             if (!strcmp(instr->mnemonic, m1_ops[j])) {
                instr->m_extra++;
-               if (instr->optype == READOP && (instr->mode == ABSX || instr->mode == ABSY)) {
-                  // add 1 further cycle if x=0: ABS,X or ABS,Y
-                  instr->x_extra++;
-               }
                break;
             }
          }
@@ -896,10 +957,6 @@ static void em_65816_init(arguments_t *args) {
          for (int j = 0; x1_ops[j]; j++) {
             if (!strcmp(instr->mnemonic, x1_ops[j])) {
                instr->x_extra++;
-               if (instr->mode == ABSX || instr->mode == ABSY) {
-                  // add 1 further cycle if x=0: LDX ABS,Y or LDY ABS,X
-                  instr->x_extra++;
-               }
                break;
             }
          }
@@ -953,7 +1010,7 @@ static int em_65816_match_interrupt(sample_t *sample_q, int num_samples) {
    return 0;
 }
 
-static int em_65816_count_cycles(sample_t *sample_q, int intr_seen) {
+static int em_65816_count_cycles(sample_t *sample_q, int num_samples, int intr_seen) {
    if (sample_q[0].type == UNKNOWN) {
       return count_cycles_without_sync(sample_q, intr_seen);
    } else {
@@ -1102,20 +1159,41 @@ static void em_65816_emulate(sample_t *sample_q, int num_cycles, instruction_t *
             memory_read(sample_q[2 + dpextra].data, (DP & 0xFF00) +                op1, MEM_POINTER);
             memory_read(sample_q[3 + dpextra].data, (DP & 0xFF00) + ((op1 + 1) & 0xff), MEM_POINTER);
          } else {
-            memory_read(sample_q[2 + dpextra].data, DP + op1    , MEM_POINTER);
-            memory_read(sample_q[3 + dpextra].data, DP + op1 + 1, MEM_POINTER);
+            memory_read(sample_q[2 + dpextra].data, (DP + op1    ) & 0xffff, MEM_POINTER);
+            memory_read(sample_q[3 + dpextra].data, (DP + op1 + 1) & 0xffff, MEM_POINTER);
          }
       }
       break;
    case INDX:
+
+      // In emulation mode when the low byte of D is nonzero, the
+      // (direct,X) addressing mode behaves strangely:
+      //
+      // The low byte of the indirect address is read from
+      // `direct_addr+X+D` without page wrapping (as expected).
+      //
+      // The high byte is read from `direct_addr+X+D+1`, but the +1 is
+      // done *with* wrapping within the page.
+      //
+      // For example: Emulation=1, D=$11A, X=$EE, and the instruction
+      // is `lda ($F7,X)`. Here $F7 + $11A + $EE = $2FF. The low byte
+      // of the address is read from $2FF and the high byte from
+      // $200. This behavior only applies to this addressing mode, and
+      // not to other indirect modes.
+
       // <opcode> <op1> [ <dpextra> ] <dummy> <addrlo> <addrhi> <operand>
       if (DP >= 0 && X >= 0) {
          if (wrap) {
             memory_read(sample_q[3 + dpextra].data, (DP & 0xFF00) + ((op1 + X    ) & 0xff), MEM_POINTER);
             memory_read(sample_q[4 + dpextra].data, (DP & 0xFF00) + ((op1 + X + 1) & 0xff), MEM_POINTER);
          } else {
-            memory_read(sample_q[3 + dpextra].data, DP + op1 + X    , MEM_POINTER);
-            memory_read(sample_q[4 + dpextra].data, DP + op1 + X + 1, MEM_POINTER);
+            memory_read(sample_q[3 + dpextra].data, (DP + op1 + X) & 0xffff, MEM_POINTER);
+            if (E) {
+               // This one is very strange, see above cooment
+               memory_read(sample_q[4 + dpextra].data, ((DP + op1 + X) & 0xff00) + ((DP + op1 + X + 1) & 0xff), MEM_POINTER);
+            } else {
+               memory_read(sample_q[4 + dpextra].data, (DP + op1 + X + 1) & 0xffff, MEM_POINTER);
+            }
          }
       }
       break;
@@ -1126,8 +1204,8 @@ static void em_65816_emulate(sample_t *sample_q, int num_cycles, instruction_t *
             memory_read(sample_q[2 + dpextra].data, (DP & 0xFF00) + op1               , MEM_POINTER);
             memory_read(sample_q[3 + dpextra].data, (DP & 0xFF00) + ((op1 + 1) & 0xff), MEM_POINTER);
          } else {
-            memory_read(sample_q[2 + dpextra].data, DP + op1    , MEM_POINTER);
-            memory_read(sample_q[3 + dpextra].data, DP + op1 + 1, MEM_POINTER);
+            memory_read(sample_q[2 + dpextra].data, (DP + op1    ) & 0xffff, MEM_POINTER);
+            memory_read(sample_q[3 + dpextra].data, (DP + op1 + 1) & 0xffff, MEM_POINTER);
          }
       }
       break;
@@ -1143,18 +1221,18 @@ static void em_65816_emulate(sample_t *sample_q, int num_cycles, instruction_t *
       // e.g. LDA [80]
       // <opcode> <op1> [ <dpextra> ] <addrlo> <addrhi> <bank> <operand>
       if (DP >= 0) {
-         memory_read(sample_q[2 + dpextra].data, DP + op1    , MEM_POINTER);
-         memory_read(sample_q[3 + dpextra].data, DP + op1 + 1, MEM_POINTER);
-         memory_read(sample_q[4 + dpextra].data, DP + op1 + 2, MEM_POINTER);
+         memory_read(sample_q[2 + dpextra].data, (DP + op1    ) & 0xffff, MEM_POINTER);
+         memory_read(sample_q[3 + dpextra].data, (DP + op1 + 1) & 0xffff, MEM_POINTER);
+         memory_read(sample_q[4 + dpextra].data, (DP + op1 + 2) & 0xffff, MEM_POINTER);
       }
       break;
    case IDLY:
       // e.g. LDA [80],Y
       // <opcode> <op1> [ <dpextra> ] <addrlo> <addrhi> <bank> <operand>
       if (DP >= 0) {
-         memory_read(sample_q[2 + dpextra].data, DP + op1    , MEM_POINTER);
-         memory_read(sample_q[3 + dpextra].data, DP + op1 + 1, MEM_POINTER);
-         memory_read(sample_q[4 + dpextra].data, DP + op1 + 2, MEM_POINTER);
+         memory_read(sample_q[2 + dpextra].data, (DP + op1    ) & 0xffff, MEM_POINTER);
+         memory_read(sample_q[3 + dpextra].data, (DP + op1 + 1) & 0xffff, MEM_POINTER);
+         memory_read(sample_q[4 + dpextra].data, (DP + op1 + 2) & 0xffff, MEM_POINTER);
       }
       break;
    case IAL:
@@ -1262,7 +1340,7 @@ static void em_65816_emulate(sample_t *sample_q, int num_cycles, instruction_t *
    // See RMW comment above for bus cycles
    operand_t operand2 = operand;
    if (instr->optype == RMWOP) {
-      if (E == 0 && MS == 0) {
+      if (E == 0 && ((instr->m_extra && (MS == 0)) || (instr->x_extra && (XS == 0)))) {
          // 16-bit - byte ordering is high then low
          operand2 = (sample_q[num_cycles - 2].data << 8) + sample_q[num_cycles - 1].data;
       } else {
@@ -1270,7 +1348,7 @@ static void em_65816_emulate(sample_t *sample_q, int num_cycles, instruction_t *
          operand2 = sample_q[num_cycles - 1].data;
       }
    } else if (instr->optype == WRITEOP) {
-      if (E == 0 && MS == 0) {
+      if (E == 0 && ((instr->m_extra && (MS == 0)) || (instr->x_extra && (XS == 0)))) {
          // 16-bit - byte ordering is low then high
          operand2 = (sample_q[num_cycles - 1].data << 8) + sample_q[num_cycles - 2].data;
       } else {
@@ -1671,27 +1749,27 @@ cpu_emulator_t em_65816 = {
 // Push Effective Absolute Address
 static int op_PEA(operand_t operand, ea_t ea) {
    // always pushes a 16-bit value
-   push16(ea);
+   push16new(ea);
    return -1;
 }
 
 // Push Effective Relative Address
 static int op_PER(operand_t operand, ea_t ea) {
    // always pushes a 16-bit value
-   push16(ea);
+   push16new(ea);
    return -1;
 }
 
 // Push Effective Indirect Address
 static int op_PEI(operand_t operand, ea_t ea) {
    // always pushes a 16-bit value
-   push16(operand);
+   push16new(operand);
    return -1;
 }
 
 // Push Data Bank Register
 static int op_PHB(operand_t operand, ea_t ea) {
-   push8(operand);
+   push8(operand); // stack wrapping on push8 is same for old and new instructions
    if (DB >= 0) {
       if (operand != DB) {
          failflag = 1;
@@ -1703,7 +1781,7 @@ static int op_PHB(operand_t operand, ea_t ea) {
 
 // Push Program Bank Register
 static int op_PHK(operand_t operand, ea_t ea) {
-   push8(operand);
+   push8(operand); // stack wrapping on push8 is same for old and new instructions
    if (PB >= 0) {
       if (operand != PB) {
          failflag = 1;
@@ -1715,7 +1793,7 @@ static int op_PHK(operand_t operand, ea_t ea) {
 
 // Push Direct Page Register
 static int op_PHD(operand_t operand, ea_t ea) {
-   push16(operand);
+   push16new(operand);
    if (DP >= 0) {
       if (operand != DP) {
          failflag = 1;
@@ -1729,7 +1807,7 @@ static int op_PHD(operand_t operand, ea_t ea) {
 static int op_PLB(operand_t operand, ea_t ea) {
    DB = operand;
    set_NZ8(DB);
-   pop8(operand);
+   pop8new(operand);
    return -1;
 }
 
@@ -1737,7 +1815,7 @@ static int op_PLB(operand_t operand, ea_t ea) {
 static int op_PLD(operand_t operand, ea_t ea) {
    DP = operand;
    set_NZ16(DP);
-   pop16(operand);
+   pop16new(operand);
    return -1;
 }
 
@@ -1754,11 +1832,28 @@ static int op_MV(int data, int sba, int dba, int dir) {
       int C = (((B << 8) | A) - 1) & 0xffff;
       A = C & 0xff;
       B = (C >> 8) & 0xff;
-      if (X >= 0) {
-         X = (X + dir) & 0xffff;
-      }
-      if (Y >= 0) {
-         Y = (Y + dir) & 0xffff;
+      if (XS > 0) {
+         // 8-bit mode
+         if (X >= 0) {
+            X = (X + dir) & 0xff;
+         }
+         if (Y >= 0) {
+            Y = (Y + dir) & 0xff;
+         }
+      } else if (XS == 0) {
+         // 16-bit mode
+         if (X >= 0) {
+            X = (X + dir) & 0xffff;
+         }
+         if (Y >= 0) {
+            Y = (Y + dir) & 0xffff;
+         }
+      } else {
+         // mode undefined
+         // TODO: we could be less pessimistic and only go to undefined
+         // when a page boundary is crossed
+         X = -1;
+         Y = -1;
       }
       if (PC >= 0 && C != 0xffff) {
          PC -= 3;
@@ -1802,6 +1897,12 @@ static int op_TCD(operand_t operand, ea_t ea) {
 static int op_TCS(operand_t operand, ea_t ea) {
    SH = B;
    SL = A;
+   // Force SH to be 1 in emulation mode
+   if (E == 1) {
+      SH = 1;
+   } else if (E < 0 && SH != 1) {
+      SH = -1;
+   }
    return -1;
 }
 
@@ -1900,6 +2001,7 @@ static void repsep(int operand, int val) {
       }
       if (operand & 0x10) {
          XS = val;
+         x_flag_updated();
       }
    }
    if (operand & 0x08) {
@@ -1938,8 +2040,7 @@ static int op_JSL(operand_t operand, ea_t ea) {
 // Return from Subroutine Long
 static int op_RTL(operand_t operand, ea_t ea) {
    // RTL: the operand is the data pulled from the stack (PCL, PCH, PB)
-   pop16(operand);      // PC
-   pop8(operand >> 16); // PB
+   pop24new(operand);
    // The +1 is handled elsewhere
    PC = operand & 0xffff;
    PB = (operand >> 16) & 0xff;
@@ -2423,6 +2524,12 @@ static int op_JSR(operand_t operand, ea_t ea) {
    return -1;
 }
 
+static int op_JSR_new(operand_t operand, ea_t ea) {
+   // JSR: the operand is the data pushed to the stack (PCH, PCL)
+   push16new(operand);  // PC
+   return -1;
+}
+
 static int op_LDA(operand_t operand, ea_t ea) {
    A = operand & 0xff;
    if (MS == 0) {
@@ -2858,7 +2965,7 @@ static void transfer_16_88(int src, int *dsthi, int *dstlo) {
          *dstlo = -1;
          set_NZ_unknown();
       }
-   } if (MS == 1) {
+   } else if (MS == 1) {
       // 8-bit
       if (src >= 0) {
          *dstlo = src & 0xff;
@@ -2907,9 +3014,11 @@ static int op_TXS(operand_t operand, ea_t ea) {
       SH = -1;
       SL = -1;
    }
-   // Force SH to be 01 in emulation mode
+   // Force SH to be 1 in emulation mode
    if (E == 1) {
-      SH = 0x01;
+      SH = 1;
+   } else if (E < 0 && SH != 1) {
+      SH = -1;
    }
    return -1;
 }
@@ -3177,7 +3286,7 @@ static InstrType instr_table_65c816[] = {
    /* F9 */   { "SBC",  0, ABSY  , 4, 0, READOP,   op_SBC},
    /* FA */   { "PLX",  0, IMP   , 4, 0, OTHER,    op_PLX},
    /* FB */   { "XCE",  0, IMP   , 2, 1, OTHER,    op_XCE},
-   /* FC */   { "JSR",  0, IND1X , 8, 1, OTHER,    op_JSR},
+   /* FC */   { "JSR",  0, IND1X , 8, 1, OTHER,    op_JSR_new},
    /* FD */   { "SBC",  0, ABSX  , 4, 0, READOP,   op_SBC},
    /* FE */   { "INC",  0, ABSX  , 7, 0, RMWOP,    op_INC},
    /* FF */   { "SBC",  0, ALX   , 5, 1, READOP,   op_SBC}
