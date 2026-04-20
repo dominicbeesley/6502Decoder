@@ -38,6 +38,7 @@ typedef enum {
    RMWOP,
    BRANCHOP,
    JSRJMPOP,
+   PUSHOP,
    OTHER
 } OpType;
 
@@ -466,6 +467,10 @@ static void em_6800_emulate(sample_t *sample_q, int num_cycles, instruction_t *i
          //      <opcode> <op1>       <read old> <write old> <write new>
          // Want to pick off the read
          operand = sample_q[num_cycles - 3].data;
+      } else if (instr->optype == PUSHOP) {
+         // e.g. <opcode> <op1> <write> <dead>
+         // This needs special handling because of the dead cycle at the end
+         operand = sample_q[num_cycles - 2].data;
       } else if (instr->mode == IMM8) {
          // Immediate addressing mode: the operand is the 2nd byte of the instruction
          operand = op1;
@@ -1669,8 +1674,8 @@ static InstrType instr_table_6800[] = {
    /* 33 */   { "PUL B", 0,   ACC,  4,     OTHER, op_PULB},
    /* 34 */   { "DES  ", 0,   INH,  4,     OTHER,  op_DES},
    /* 35 */   { "TXS  ", 0,   INH,  4,     OTHER,  op_TXS},
-   /* 36 */   { "PSH A", 0,   ACC,  4,     OTHER, op_PSHA},
-   /* 37 */   { "PSH B", 0,   ACC,  4,     OTHER, op_PSHB},
+   /* 36 */   { "PSH A", 0,   ACC,  4,    PUSHOP, op_PSHA},
+   /* 37 */   { "PSH B", 0,   ACC,  4,    PUSHOP, op_PSHB},
    /* 38 */   { "???  ", 1,   INH,  2,     OTHER,       0},
    /* 39 */   { "RTS  ", 0,   INH,  5,     OTHER,  op_RTS},
    /* 3A */   { "???  ", 1,   INH,  2,     OTHER,       0},
