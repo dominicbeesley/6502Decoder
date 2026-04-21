@@ -1732,9 +1732,9 @@ static InstrType instr_table_6800[] = {
    /* 6A */   { "DEC  ", 0,  IDX8,  7,     RMWOP,  op_DEC},
    /* 6B */   { "???  ", 1,  IDX8,  7,     OTHER,       0},
    /* 6C */   { "INC  ", 0,  IDX8,  7,     RMWOP,  op_INC},
-   /* 6D */   { "TST  ", 0,  IDX8,  7,    READOP,  op_TST},
+   /* 6D */   { "TST  ", 0,  IDX8,  7,     RMWOP,  op_TST},
    /* 6E */   { "JMP  ", 0,  IDX8,  4,  JSRJMPOP,  op_JMP},
-   /* 6F */   { "CLR  ", 0,  IDX8,  7,   WRITEOP,  op_CLR},
+   /* 6F */   { "CLR  ", 0,  IDX8,  7,     RMWOP,  op_CLR},
 
    /* 70 */   { "NEG  ", 0,  EXT8,  6,     RMWOP,  op_NEG},
    /* 71 */   { "???  ", 1,  EXT8,  6,     OTHER,       0},
@@ -1749,9 +1749,9 @@ static InstrType instr_table_6800[] = {
    /* 7A */   { "DEC  ", 0,  EXT8,  6,     RMWOP,  op_DEC},
    /* 7B */   { "???  ", 1,  EXT8,  6,     OTHER,       0},
    /* 7C */   { "INC  ", 0,  EXT8,  6,     RMWOP,  op_INC},
-   /* 7D */   { "TST  ", 0,  EXT8,  6,    READOP,  op_TST},
+   /* 7D */   { "TST  ", 0,  EXT8,  6,     RMWOP,  op_TST},
    /* 7E */   { "JMP  ", 0,  EXT8,  3,  JSRJMPOP,  op_JMP},
-   /* 7F */   { "CLR  ", 0,  EXT8,  6,   WRITEOP,  op_CLR},
+   /* 7F */   { "CLR  ", 0,  EXT8,  6,     RMWOP,  op_CLR},
 
    /* 80 */   { "SUB A", 0,  IMM8,  2,     OTHER, op_SUBA},
    /* 81 */   { "CMP A", 0,  IMM8,  2,     OTHER, op_CMPA},
