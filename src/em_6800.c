@@ -854,9 +854,9 @@ static int sta_helper(int val, operand_t operand) {
          failflag = 1;
       }
    }
-   set_NZ(val);
+   set_NZ(operand);
    V = 0;
-   return val;
+   return operand;
 }
 
 static int sub_helper(int val, int operand, int carry) {
