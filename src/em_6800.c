@@ -1227,7 +1227,7 @@ static int op_DAA(operand_t operand, ea_t ea, sample_t *sample_q) {
       }
       int tmp = A + correction;
       // TODO: On the 6809 C is apparently only ever set by DAA, never cleared
-      C = (tmp >> 8) & 1;
+      C |= (tmp >> 8) & 1;
       // V is is calculated as follows on both the 6809 and the 6309
       V = ((tmp >> 7) & 1) ^ C;
       tmp &= 0xff;
